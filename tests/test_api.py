@@ -70,6 +70,61 @@ class ApiTestCase(unittest.TestCase):
 
     # ------------------------------------------------------------ 认证
 
+    def test_register_success(self):
+        """注册成功即登录态：返回 token + user，且可用新账号登录访问。"""
+        res = self.client.post('/api/users', json={
+            'username': 'alice', 'password': '123456', 'name': '爱丽丝', 'role': 'student',
+        })
+        self.assertEqual(res.status_code, 201)
+        body = res.get_json()
+        self.assertEqual(body['user']['username'], 'alice')
+        self.assertEqual(body['user']['name'], '爱丽丝')
+        self.assertEqual(body['user']['role'], 'student')
+        self.assertNotIn('password', body['user'])
+        self.assertTrue(body['token'])
+        # 注册的 token 直接可用
+        res = self.client.get('/api/me', headers={'Authorization': f"Bearer {body['token']}"})
+        self.assertEqual(res.get_json()['user']['id'], body['user']['id'])
+        # 新账号可正常登录
+        res = self.client.post('/api/sessions', json={'username': 'alice', 'password': '123456'})
+        self.assertEqual(res.status_code, 201)
+        # 新用户无任何项目
+        token = res.get_json()['token']
+        res = self.client.get('/api/projects', headers={'Authorization': f"Bearer {token}"})
+        self.assertEqual(res.get_json()['items'], [])
+
+    def test_register_teacher_role(self):
+        res = self.client.post('/api/users', json={
+            'username': 'teacher2', 'password': '123456', 'name': '李老师', 'role': 'teacher',
+        })
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.get_json()['user']['role'], 'teacher')
+
+    def test_register_username_taken(self):
+        res = self.client.post('/api/users', json={
+            'username': 'student', 'password': '123456', 'name': '重复', 'role': 'student',
+        })
+        self.assert_error(res, 409, 'USERNAME_TAKEN')
+
+    def test_register_validation(self):
+        base = {'username': 'alice', 'password': '123456', 'name': '爱丽丝', 'role': 'student'}
+        # 缺失字段
+        for missing in ('username', 'password', 'name'):
+            body = {k: v for k, v in base.items() if k != missing}
+            self.assert_error(self.client.post('/api/users', json=body), 400, 'VALIDATION_ERROR')
+        # 用户名过短
+        body = {**base, 'username': 'ab'}
+        self.assert_error(self.client.post('/api/users', json=body), 400, 'VALIDATION_ERROR')
+        # 密码过短
+        body = {**base, 'password': '12345'}
+        self.assert_error(self.client.post('/api/users', json=body), 400, 'VALIDATION_ERROR')
+        # 非法角色
+        body = {**base, 'role': 'admin'}
+        self.assert_error(self.client.post('/api/users', json=body), 400, 'VALIDATION_ERROR')
+        # 失败不产生登录态
+        res = self.client.post('/api/sessions', json={'username': 'alice', 'password': '123456'})
+        self.assert_error(res, 401, 'INVALID_CREDENTIALS')
+
     def test_login_success(self):
         self.assertEqual(self.student['user']['id'], 'u1')
         self.assertEqual(self.student['user']['role'], 'student')
