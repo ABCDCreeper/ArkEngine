@@ -1,6 +1,6 @@
-# InnoArk「虫洞·星桥」后端
+# ArkEngine
 
-智能跨学科项目式学习协同平台（InnoArk）的 Flask 后端，按前端 API 契约 [docs/api.md](../InnoArk/docs/api.md) 实现。
+InnoArk 的 Flask 后端，按前端 API 契约 [docs/api.md](../InnoArk/docs/api.md) 实现。
 
 ## 核心功能
 
