@@ -1,0 +1,450 @@
+"""InnoArk 后端端到端测试（Flask test client + 临时 SQLite）。
+
+运行：python -m unittest discover -s tests -v
+每个用例使用独立临时数据库（种子数据保持一致），互不影响。
+"""
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app import create_app  # noqa: E402
+from app.services import FEEDBACK_POOL  # noqa: E402
+
+
+class ApiTestCase(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        self.app = create_app({'DATABASE': self.db_path})
+        self.client = self.app.test_client()
+        self.student = self._login('student', '123456')
+        self.student2 = self._login('student2', '123456')
+        self.student4 = self._login('student4', '123456')
+        self.teacher = self._login('teacher', '123456')
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    # ------------------------------------------------------------ 工具方法
+
+    def _login(self, username, password):
+        res = self.client.post('/api/sessions', json={'username': username, 'password': password})
+        assert res.status_code == 201, (username, res.status_code, res.get_json())
+        data = res.get_json()
+        return {'token': data['token'], 'user': data['user']}
+
+    def _request(self, user, method, path, json=None):
+        kw = {'headers': {'Authorization': f"Bearer {user['token']}"}}
+        if json is not None:
+            kw['json'] = json
+        return getattr(self.client, method)(path, **kw)
+
+    def _get(self, user, path):
+        return self._request(user, 'get', path)
+
+    def _post(self, user, path, body=None):
+        return self._request(user, 'post', path, body)
+
+    def _patch(self, user, path, body=None):
+        return self._request(user, 'patch', path, body)
+
+    def _delete(self, user, path):
+        return self._request(user, 'delete', path)
+
+    def assert_error(self, res, status, code):
+        self.assertEqual(res.status_code, status)
+        self.assertEqual(res.get_json()['error']['code'], code)
+
+    def create_project(self, user, topic_id='topic1', name=None):
+        res = self._post(user, '/api/projects', {'topicId': topic_id, 'name': name} if name else {'topicId': topic_id})
+        self.assertEqual(res.status_code, 201, res.get_json())
+        return res.get_json()
+
+    def create_task(self, user, project_id, title='测试任务'):
+        res = self._post(user, f'/api/projects/{project_id}/tasks', {'title': title})
+        self.assertEqual(res.status_code, 201, res.get_json())
+        return res.get_json()
+
+    # ------------------------------------------------------------ 认证
+
+    def test_login_success(self):
+        self.assertEqual(self.student['user']['id'], 'u1')
+        self.assertEqual(self.student['user']['role'], 'student')
+        self.assertNotIn('password', self.student['user'])
+
+    def test_login_bad_credentials(self):
+        res = self._post(self.student, '/api/sessions', {'username': 'student', 'password': 'wrong'})
+        self.assert_error(res, 401, 'INVALID_CREDENTIALS')
+
+    def test_login_missing_fields(self):
+        res = self._post(self.student, '/api/sessions', {'username': 'student'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+
+    def test_unauthorized(self):
+        res = self.client.get('/api/topics')
+        self.assert_error(res, 401, 'UNAUTHORIZED')
+
+    def test_invalid_token(self):
+        res = self.client.get('/api/topics', headers={'Authorization': 'Bearer bad.token'})
+        self.assert_error(res, 401, 'UNAUTHORIZED')
+
+    def test_me(self):
+        res = self._get(self.teacher, '/api/me')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.get_json()['user']['role'], 'teacher')
+
+    def test_logout_invalidates_token(self):
+        res = self._delete(self.student, '/api/sessions/current')
+        self.assertEqual(res.status_code, 204)
+        res = self._get(self.student, '/api/me')
+        self.assert_error(res, 401, 'UNAUTHORIZED')
+
+    # ------------------------------------------------------------ 课题与项目
+
+    def test_topics(self):
+        res = self._get(self.student, '/api/topics')
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertEqual(body['total'], 4)
+        topic = body['items'][0]
+        self.assertIsInstance(topic['subjects'], list)
+        self.assertIn('difficulty', topic)
+
+    def test_my_projects(self):
+        res = self._get(self.student, '/api/projects')
+        ids = [p['id'] for p in res.get_json()['items']]
+        self.assertIn('p1', ids)
+        self.assertIn('p2', ids)
+        # 教师无参与项目，返回空数组
+        res = self._get(self.teacher, '/api/projects')
+        self.assertEqual(res.get_json()['items'], [])
+
+    def test_create_project(self):
+        project = self.create_project(self.student2, 'topic2', '新项目')
+        self.assertEqual(project['leaderId'], 'u2')
+        self.assertEqual(project['status'], 'active')
+        self.assertEqual(project['name'], '新项目')
+        self.assertTrue(project['inviteCode'].startswith('P'))
+        self.assertEqual([m['id'] for m in project['members']], ['u2'])
+        # 根导图节点已初始化
+        res = self._get(self.student2, f"/api/projects/{project['id']}/mind-nodes")
+        nodes = res.get_json()['items']
+        self.assertEqual(len(nodes), 1)
+        self.assertIsNone(nodes[0]['parentId'])
+        # name 省略时默认取课题名
+        project2 = self.create_project(self.student2, 'topic3')
+        self.assertEqual(project2['name'], '星舰生命维持系统')
+
+    def test_join_project(self):
+        # u4（student4）不在 p1，可加入
+        res = self._post(self.student4, '/api/projects/join', {'inviteCode': 'P1-7F3A'})
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(len(res.get_json()['members']), 4)
+        # 再次加入 -> ALREADY_MEMBER
+        res = self._post(self.student4, '/api/projects/join', {'inviteCode': 'p1-7f3a'})  # 大小写不敏感
+        self.assert_error(res, 409, 'ALREADY_MEMBER')
+        # 无效邀请码
+        res = self._post(self.student4, '/api/projects/join', {'inviteCode': 'P9-XXXX'})
+        self.assert_error(res, 409, 'INVALID_INVITE')
+        # p1 已满 4 人，教师（非成员）尝试加入 -> TEAM_FULL
+        res = self._post(self.teacher, '/api/projects/join', {'inviteCode': 'P1-7F3A'})
+        self.assert_error(res, 409, 'TEAM_FULL')
+
+    def test_project_detail_permissions(self):
+        # 非成员学生 -> 403
+        res = self._get(self.student4, '/api/projects/p1')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 教师可读任意项目
+        res = self._get(self.teacher, '/api/projects/p1')
+        self.assertEqual(res.status_code, 200)
+        # 不存在的项目 -> 404 PROJECT_NOT_FOUND
+        res = self._get(self.student, '/api/projects/nope')
+        self.assert_error(res, 404, 'PROJECT_NOT_FOUND')
+
+    def test_update_project(self):
+        res = self._patch(self.student, '/api/projects/p1', {'name': '火星基地能源方案 v2'})
+        self.assertEqual(res.get_json()['name'], '火星基地能源方案 v2')
+        # 空名称 -> 400
+        res = self._patch(self.student, '/api/projects/p1', {'name': ''})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 非成员改名 -> 403
+        res = self._patch(self.student4, '/api/projects/p1', {'name': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+
+    def test_finish_project(self):
+        res = self._patch(self.student, '/api/projects/p1', {'status': 'finished'})
+        body = res.get_json()
+        self.assertEqual(body['status'], 'finished')
+        self.assertIsNotNone(body['finishedAt'])
+        # 结题生成里程碑反馈
+        res = self._get(self.student, '/api/projects/p1/feedbacks')
+        feedbacks = res.get_json()['items']
+        self.assertEqual(feedbacks[0]['type'], 'milestone')
+        self.assertIn('结题', feedbacks[0]['content'])
+        # 结题后档案可访问
+        res = self._get(self.student, '/api/projects/p1/archive')
+        self.assertEqual(res.status_code, 200)
+
+    def test_archive_requires_finished(self):
+        res = self._get(self.student, '/api/projects/p1/archive')
+        self.assert_error(res, 409, 'PROJECT_NOT_FINISHED')
+
+    def test_archive_content(self):
+        res = self._get(self.student, '/api/projects/p2/archive')
+        body = res.get_json()
+        self.assertEqual(body['summary']['taskTotal'], 4)
+        self.assertEqual(body['summary']['doneTotal'], 4)
+        self.assertEqual(body['summary']['durationDays'], 34)
+        self.assertEqual(len(body['tasks']), 4)
+        self.assertEqual(len(body['mindNodes']), 4)
+        # 成员贡献统计
+        u1 = next(m for m in body['members'] if m['user']['id'] == 'u1')
+        self.assertEqual(u1['taskCount'], 2)
+        self.assertEqual(u1['doneCount'], 2)
+
+    # ------------------------------------------------------------ 星云看板
+
+    def test_mind_node_crud(self):
+        # 创建子节点
+        res = self._post(self.student, '/api/projects/p1/mind-nodes', {'parentId': 'n1', 'label': '新分支'})
+        self.assertEqual(res.status_code, 201)
+        child = res.get_json()
+        self.assertEqual(child['parentId'], 'n1')
+        # 空标签 / 无效父节点 -> 400
+        res = self._post(self.student, '/api/projects/p1/mind-nodes', {'parentId': 'n1', 'label': ''})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        res = self._post(self.student, '/api/projects/p1/mind-nodes', {'parentId': 'nope', 'label': 'x'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 重命名
+        res = self._patch(self.student, f"/api/mind-nodes/{child['id']}", {'label': '重命名分支'})
+        self.assertEqual(res.get_json()['label'], '重命名分支')
+        # 删除含子树：给子节点再加一个孙节点，删除子节点后两者都消失
+        res = self._post(self.student, '/api/projects/p1/mind-nodes', {'parentId': child['id'], 'label': '孙节点'})
+        grandchild = res.get_json()
+        res = self._delete(self.student, f"/api/mind-nodes/{child['id']}")
+        self.assertEqual(res.status_code, 204)
+        items = self._get(self.student, '/api/projects/p1/mind-nodes').get_json()['items']
+        ids = [n['id'] for n in items]
+        self.assertNotIn(child['id'], ids)
+        self.assertNotIn(grandchild['id'], ids)
+        # 教师只读
+        res = self._post(self.teacher, '/api/projects/p1/mind-nodes', {'parentId': 'n1', 'label': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 不存在 -> 404
+        res = self._patch(self.student, '/api/mind-nodes/nope', {'label': 'x'})
+        self.assert_error(res, 404, 'NOT_FOUND')
+
+    def test_notes_crud(self):
+        res = self._post(self.student, '/api/projects/p1/notes', {'content': '新灵感', 'x': 100, 'y': 200})
+        self.assertEqual(res.status_code, 201)
+        note = res.get_json()
+        self.assertEqual(note['color'], '#fde68a')  # 默认颜色
+        # 部分更新
+        res = self._patch(self.student, f"/api/notes/{note['id']}", {'content': '改过的灵感', 'color': '#bbf7d0'})
+        body = res.get_json()
+        self.assertEqual(body['content'], '改过的灵感')
+        self.assertEqual(body['color'], '#bbf7d0')
+        self.assertEqual(body['x'], 100)  # 未提交字段保持不变
+        # 删除
+        res = self._delete(self.student, f"/api/notes/{note['id']}")
+        self.assertEqual(res.status_code, 204)
+        items = self._get(self.student, '/api/projects/p1/notes').get_json()['items']
+        self.assertNotIn(note['id'], [n['id'] for n in items])
+        # 不存在 -> 404
+        res = self._delete(self.student, '/api/notes/nope')
+        self.assert_error(res, 404, 'NOT_FOUND')
+
+    # ------------------------------------------------------------ PBL 任务
+
+    def test_create_task(self):
+        task = self.create_task(self.student, 'p1', '新任务')
+        self.assertEqual(task['status'], 'todo')
+        self.assertIsNone(task['assigneeId'])
+        # 自动追加 create 动态
+        logs = self._get(self.student, '/api/projects/p1/task-logs').get_json()['items']
+        self.assertEqual(logs[0]['taskId'], task['id'])
+        self.assertEqual(logs[0]['action'], 'create')
+        # 空标题 -> 400
+        res = self._post(self.student, '/api/projects/p1/tasks', {'title': ''})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+
+    def test_task_claim(self):
+        task = self.create_task(self.student, 'p1')
+        # 认领给自己
+        res = self._patch(self.student, f"/api/tasks/{task['id']}", {'assigneeId': 'u1'})
+        self.assertEqual(res.get_json()['assigneeId'], 'u1')
+        # 认领他人 -> 403
+        res = self._patch(self.student, f"/api/tasks/{task['id']}", {'assigneeId': 'u2'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 取消认领
+        res = self._patch(self.student, f"/api/tasks/{task['id']}", {'assigneeId': None})
+        self.assertIsNone(res.get_json()['assigneeId'])
+
+    def test_task_status_flow_creates_checkin_and_feedback(self):
+        task = self.create_task(self.student, 'p1')
+        for status in ('doing', 'review', 'done'):
+            res = self._patch(self.student, f"/api/tasks/{task['id']}", {'status': status})
+            self.assertEqual(res.status_code, 200, res.get_json())
+        # 动态（按时间倒序）：3 次 status + create
+        logs = self._get(self.student, '/api/projects/p1/task-logs').get_json()['items']
+        task_logs = [l for l in logs if l['taskId'] == task['id']]
+        self.assertEqual([l['action'] for l in task_logs], ['status', 'status', 'status', 'create'])
+        # 完成时自动生成打卡 + 里程碑反馈
+        checkins = self._get(self.student, '/api/projects/p1/checkins').get_json()['items']
+        auto = next(c for c in checkins if c['userId'] == 'u1' and '里程碑任务' in c['content'])
+        self.assertEqual(auto['content'], f"完成里程碑任务「{task['title']}」")
+        feedbacks = self._get(self.student, '/api/projects/p1/feedbacks').get_json()['items']
+        self.assertEqual(feedbacks[0]['type'], 'milestone')
+        self.assertIn(feedbacks[0]['content'], FEEDBACK_POOL)
+        # 非法状态 -> 400
+        res = self._patch(self.student, f"/api/tasks/{task['id']}", {'status': 'nope'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+
+    def test_task_filters_and_delete(self):
+        res = self._get(self.student, '/api/projects/p1/tasks?status=done')
+        self.assertTrue(all(t['status'] == 'done' for t in res.get_json()['items']))
+        res = self._get(self.student, '/api/projects/p1/tasks?assigneeId=u1')
+        self.assertTrue(all(t['assigneeId'] == 'u1' for t in res.get_json()['items']))
+        # 删除任务并记录 delete 动态
+        task = self.create_task(self.student, 'p1')
+        res = self._delete(self.student, f"/api/tasks/{task['id']}")
+        self.assertEqual(res.status_code, 204)
+        logs = self._get(self.student, '/api/projects/p1/task-logs').get_json()['items']
+        self.assertEqual(logs[0]['action'], 'delete')
+        self.assertIn('删除任务', logs[0]['detail'])
+        # 不存在 -> 404 TASK_NOT_FOUND
+        res = self._patch(self.student, '/api/tasks/nope', {'status': 'done'})
+        self.assert_error(res, 404, 'TASK_NOT_FOUND')
+
+    # ------------------------------------------------------------ 打卡与反馈
+
+    def test_checkin_creates_guide_feedback(self):
+        before = self._get(self.student, '/api/projects/p1/feedbacks').get_json()['total']
+        res = self._post(self.student, '/api/projects/p1/checkins', {'content': '今天完成了模型搭建'})
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.get_json()['userId'], 'u1')
+        after = self._get(self.student, '/api/projects/p1/feedbacks').get_json()['items']
+        self.assertEqual(len(after), before + 1)
+        self.assertEqual(after[0]['type'], 'guide')
+        # 空内容 -> 400
+        res = self._post(self.student, '/api/projects/p1/checkins', {'content': '  '})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+
+    # ------------------------------------------------------------ 资源
+
+    def test_resources_filter(self):
+        res = self._get(self.student, '/api/resources?category=物理')
+        items = res.get_json()['items']
+        self.assertEqual(len(items), 3)
+        self.assertTrue(all(r['category'] == '物理' for r in items))
+        # 关键词大小写不敏感，匹配标题/描述/标签
+        res = self._get(self.student, '/api/resources?keyword=ai')
+        titles = [r['title'] for r in res.get_json()['items']]
+        self.assertIn('Teachable Machine', titles)  # 标签 AI
+        res = self._get(self.student, '/api/resources?keyword=python')
+        titles = [r['title'] for r in res.get_json()['items']]
+        self.assertIn('Codecademy Python 课程', titles)
+        # 组合过滤
+        res = self._get(self.student, '/api/resources?category=工程&keyword=nasa')
+        titles = [r['title'] for r in res.get_json()['items']]
+        self.assertEqual(titles, ['NASA 开放数据平台'])
+
+    # ------------------------------------------------------------ 专注模式
+
+    def test_focus_sessions(self):
+        res = self._post(self.student, '/api/focus-sessions', {'durationMin': 25, 'type': 'focus'})
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.get_json()['durationMin'], 25)
+        res = self._post(self.student, '/api/focus-sessions', {'durationMin': 5, 'type': 'break'})
+        self.assertEqual(res.get_json()['type'], 'break')
+        # 非法时长 -> 400
+        for bad in (0, -5, 'abc'):
+            res = self._post(self.student, '/api/focus-sessions', {'durationMin': bad})
+            self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 列表按时间倒序
+        res = self._get(self.student, '/api/focus-sessions')
+        items = res.get_json()['items']
+        self.assertGreaterEqual(len(items), 2)
+        self.assertEqual(items[0]['type'], 'break')
+
+    def test_focus_stats(self):
+        res = self._get(self.student, '/api/focus/stats?days=3')
+        body = res.get_json()
+        self.assertEqual(len(body['week']), 3)
+        # 今天的记录计入 today
+        self._post(self.student, '/api/focus-sessions', {'durationMin': 25, 'type': 'focus'})
+        self._post(self.student, '/api/focus-sessions', {'durationMin': 25, 'type': 'focus'})
+        res = self._get(self.student, '/api/focus/stats?days=7')
+        body = res.get_json()
+        self.assertEqual(body['today'], {'count': 2, 'minutes': 50})
+        # week 按日期升序，最后一格是今天
+        dates = [d['date'] for d in body['week']]
+        self.assertEqual(dates, sorted(dates))
+        self.assertEqual(body['week'][-1]['count'], 2)
+        # days 上限 30
+        res = self._get(self.student, '/api/focus/stats?days=999')
+        self.assertEqual(len(res.get_json()['week']), 30)
+
+    # ------------------------------------------------------------ 教师端
+
+    def test_teacher_projects(self):
+        res = self._get(self.student, '/api/teacher/projects')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        res = self._get(self.teacher, '/api/teacher/projects')
+        self.assertEqual(res.status_code, 200)
+        ids = [p['id'] for p in res.get_json()['items']]
+        self.assertEqual(ids, ['p1', 'p2'])  # 按最近更新倒序
+
+    def test_annotations(self):
+        # 学生只读
+        res = self._get(self.student, '/api/projects/p2/annotations')
+        self.assertEqual(res.status_code, 200)
+        self.assertGreaterEqual(res.get_json()['total'], 3)
+        # 教师添加
+        res = self._post(self.teacher, '/api/projects/p2/annotations', {'content': '新批注'})
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.get_json()['userId'], 't1')
+        # 学生添加 -> 403
+        res = self._post(self.student, '/api/projects/p2/annotations', {'content': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 空内容 -> 400
+        res = self._post(self.teacher, '/api/projects/p2/annotations', {'content': ''})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+
+    def test_teacher_read_only_on_collab(self):
+        # 教师对协作内容只读：写操作全部 403
+        res = self._post(self.teacher, '/api/projects/p1/tasks', {'title': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        res = self._post(self.teacher, '/api/projects/p1/checkins', {'content': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        res = self._patch(self.teacher, '/api/tasks/t1', {'status': 'done'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        res = self._post(self.teacher, '/api/projects/p1/notes', {'content': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 但可以读
+        res = self._get(self.teacher, '/api/projects/p1/tasks')
+        self.assertEqual(res.status_code, 200)
+
+    # ------------------------------------------------------------ 通用约定
+
+    def test_pagination_shape(self):
+        res = self._get(self.student, '/api/topics')
+        body = res.get_json()
+        self.assertEqual(set(body.keys()), {'items', 'total', 'page', 'pageSize'})
+        # 显式分页
+        res = self._get(self.student, '/api/resources?page=1&pageSize=2')
+        body = res.get_json()
+        self.assertEqual(len(body['items']), 2)
+        self.assertEqual(body['page'], 1)
+        self.assertEqual(body['pageSize'], 2)
+
+    def test_unknown_route(self):
+        res = self._get(self.student, '/api/does-not-exist')
+        self.assert_error(res, 404, 'NOT_FOUND')
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
