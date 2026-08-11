@@ -2,7 +2,7 @@
 from flask import Blueprint, g, jsonify, request
 
 from ..auth import require_auth
-from ..db import commit, execute, gen_id, now_iso, query_all, query_one
+from ..db import commit, execute, gen_id, now_iso, query_all
 from ..errors import bad_request, forbidden, get_json_body
 from ..services import (
     TASK_STATUSES,

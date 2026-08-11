@@ -1,11 +1,10 @@
 """共享业务逻辑：权限校验、资源视图、任务状态变更联动（契约 2.x / 3.x）。"""
 import random
-from datetime import datetime, timezone
 
 from flask import request
 
 from .db import execute, gen_id, json_loads, now_iso, query_all, query_one
-from .errors import ApiError, bad_request, forbidden, not_found
+from .errors import ApiError, forbidden
 
 TASK_STATUSES = ('todo', 'doing', 'review', 'done')
 TASK_STATUS_LABEL = {'todo': '待认领', 'doing': '进行中', 'review': '待验收', 'done': '已完成'}
