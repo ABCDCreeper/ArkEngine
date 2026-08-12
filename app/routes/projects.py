@@ -110,14 +110,22 @@ def project_detail(project_id):
 @bp.patch('/projects/<project_id>')
 @require_auth
 def update_project(project_id):
-    """更新项目名；status=finished 结题（记录 finishedAt 并生成里程碑反馈）。"""
+    """更新项目名/简介；status=finished 结题（记录 finishedAt 并生成里程碑反馈）。组员与教师均可填写简介。"""
     project = get_project_or_404(project_id)
-    member_of(project['id'], g.user)
+    if g.user['role'] != 'teacher':
+        member_of(project['id'], g.user)
     body = get_json_body()
     if 'name' in body:
         if not body['name']:
             raise bad_request('项目名称不能为空')
         execute('UPDATE projects SET name = ? WHERE id = ?', (body['name'], project['id']))
+    if 'description' in body:
+        description = body['description']
+        if not isinstance(description, str):
+            raise bad_request('简介格式不正确')
+        if len(description) > 2000:
+            raise bad_request('简介不能超过 2000 字')
+        execute('UPDATE projects SET description = ? WHERE id = ?', (description, project['id']))
     if body.get('status') == 'finished':
         execute('UPDATE projects SET status = ?, finishedAt = ? WHERE id = ?',
                 ('finished', now_iso(), project['id']))

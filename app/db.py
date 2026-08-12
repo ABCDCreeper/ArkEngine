@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS projects (
   status TEXT NOT NULL CHECK (status IN ('active', 'finished')),
   inviteCode TEXT NOT NULL UNIQUE,
   leaderId TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
   createdAt TEXT NOT NULL,
   updatedAt TEXT NOT NULL,
   finishedAt TEXT
@@ -395,9 +396,13 @@ def seed(db: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
-    """建表；users 为空时写入种子数据。"""
+    """建表（含轻量迁移）；users 为空时写入种子数据。"""
     db = get_db()
     db.executescript(SCHEMA)
+    cols = [r['name'] for r in db.execute('PRAGMA table_info(projects)').fetchall()]
+    if 'description' not in cols:
+        db.execute("ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        db.commit()
     if not query_one('SELECT 1 FROM users LIMIT 1'):
         seed(db)
 

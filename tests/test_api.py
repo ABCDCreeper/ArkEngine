@@ -229,6 +229,30 @@ class ApiTestCase(unittest.TestCase):
         res = self._patch(self.student4, '/api/projects/p1', {'name': 'x'})
         self.assert_error(res, 403, 'FORBIDDEN')
 
+    def test_update_project_description(self):
+        # 组员填写简介
+        res = self._patch(self.student, '/api/projects/p1', {'description': '探索火星基地的能源自给方案'})
+        body = res.get_json()
+        self.assertEqual(body['description'], '探索火星基地的能源自给方案')
+        # 教师也可填写简介
+        res = self._patch(self.teacher, '/api/projects/p1', {'description': '教师修订的简介'})
+        self.assertEqual(res.get_json()['description'], '教师修订的简介')
+        # 简介可清空
+        res = self._patch(self.student, '/api/projects/p1', {'description': ''})
+        self.assertEqual(res.get_json()['description'], '')
+        # 非字符串 -> 400
+        res = self._patch(self.student, '/api/projects/p1', {'description': 123})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 超长 -> 400
+        res = self._patch(self.student, '/api/projects/p1', {'description': 'x' * 2001})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 非成员不可修改
+        res = self._patch(self.student4, '/api/projects/p1', {'description': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # GET 返回简介
+        res = self._get(self.student, '/api/projects/p1')
+        self.assertIn('description', res.get_json())
+
     def test_finish_project(self):
         res = self._patch(self.student, '/api/projects/p1', {'status': 'finished'})
         body = res.get_json()
