@@ -43,9 +43,20 @@ def member_of(project_id: str, user: dict) -> None:
 
 
 def ensure_read_access(project_id: str, user: dict) -> None:
-    """读操作：学生需为成员，教师可读全部项目。"""
-    if user['role'] != 'teacher':
-        member_of(project_id, user)
+    """读操作：教师、项目成员、公共项目、同组成员可读（组间隔离）。"""
+    if user['role'] == 'teacher':
+        return
+    if query_one('SELECT 1 FROM members WHERE projectId = ? AND userId = ?', (project_id, user['id'])):
+        return
+    project = query_one('SELECT groupId FROM projects WHERE id = ?', (project_id,))
+    if not project or project['groupId'] is None:
+        return
+    if query_one(
+        "SELECT 1 FROM group_members WHERE groupId = ? AND userId = ? AND role = 'member'",
+        (project['groupId'], user['id']),
+    ):
+        return
+    raise forbidden('仅本组成员可访问该项目')
 
 
 # ---------------------------------------------------------------- 视图组装
@@ -77,12 +88,18 @@ def project_progress(project_id: str) -> dict:
 
 
 def project_view(project: dict) -> dict:
-    """Project 视图：附加 topic 摘要、成员列表与实时进度（契约 2.3）。"""
+    """Project 视图：附加 topic 摘要、所属组、成员列表与实时进度（契约 2.3）。"""
     topic = query_one('SELECT id, title, subjects FROM topics WHERE id = ?', (project['topicId'],))
+    group = None
+    if project.get('groupId'):
+        g = query_one('SELECT id, name FROM groups WHERE id = ?', (project['groupId'],))
+        if g:
+            group = {'id': g['id'], 'name': g['name']}
     return {
         **project,
         'topic': {'id': topic['id'], 'title': topic['title'], 'subjects': json_loads(topic['subjects'])}
         if topic else None,
+        'group': group,
         'members': project_members(project['id']),
         'progress': project_progress(project['id']),
     }

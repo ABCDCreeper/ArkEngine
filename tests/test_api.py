@@ -201,19 +201,23 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(project2['name'], '星舰生命维持系统')
 
     def test_join_project(self):
-        # u4（student4）不在 p1，可加入
+        # 跨组隔离：u4（未分组）不能通过邀请码加入 g1 的 p1
         res = self._post(self.student4, '/api/projects/join', {'inviteCode': 'P1-7F3A'})
-        self.assertEqual(res.status_code, 201)
-        self.assertEqual(len(res.get_json()['members']), 4)
-        # 再次加入 -> ALREADY_MEMBER
-        res = self._post(self.student4, '/api/projects/join', {'inviteCode': 'p1-7f3a'})  # 大小写不敏感
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 已是成员的组员再加入 -> ALREADY_MEMBER（大小写不敏感）
+        res = self._post(self.student2, '/api/projects/join', {'inviteCode': 'p1-7f3a'})
         self.assert_error(res, 409, 'ALREADY_MEMBER')
         # 无效邀请码
         res = self._post(self.student4, '/api/projects/join', {'inviteCode': 'P9-XXXX'})
         self.assert_error(res, 409, 'INVALID_INVITE')
-        # p1 已满 4 人，教师（非成员）尝试加入 -> TEAM_FULL
-        res = self._post(self.teacher, '/api/projects/join', {'inviteCode': 'P1-7F3A'})
-        self.assert_error(res, 409, 'TEAM_FULL')
+        # 公共项目任意学生可凭码加入
+        p = self.create_project(self.student4, 'topic2', '公共项目')
+        res = self._post(self.student2, '/api/projects/join', {'inviteCode': p['inviteCode']})
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(len(res.get_json()['members']), 2)
+        # 教师不能加入项目
+        res = self._post(self.teacher, '/api/projects/join', {'inviteCode': p['inviteCode']})
+        self.assert_error(res, 403, 'FORBIDDEN')
 
     def test_project_detail_permissions(self):
         # 非成员学生 -> 403
@@ -711,6 +715,148 @@ class ApiTestCase(unittest.TestCase):
         self.assertIn('u1', ids)
         res = self._get(self.teacher, '/api/users?keyword=不存在的名字')
         self.assertEqual(res.get_json()['items'], [])
+
+    def test_group_join_by_code(self):
+        # 教师不能通过邀请码入组
+        res = self._post(self.teacher, '/api/groups/join', {'inviteCode': 'G1-KM3X'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 无效邀请码
+        res = self._post(self.student4, '/api/groups/join', {'inviteCode': 'G9-XXXX'})
+        self.assert_error(res, 409, 'INVALID_INVITE')
+        # 未分组学生凭码入组（大小写不敏感）
+        res = self._post(self.student4, '/api/groups/join', {'inviteCode': 'g1-km3x'})
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.get_json()['id'], 'g1')
+        # 已在组内
+        res = self._post(self.student4, '/api/groups/join', {'inviteCode': 'G1-KM3X'})
+        self.assert_error(res, 409, 'ALREADY_MEMBER')
+        # mine 现在包含 g1
+        mine = self._get(self.student4, '/api/groups/mine').get_json()['items']
+        self.assertIn('g1', [g['id'] for g in mine])
+        # 新建的组会自动生成邀请码
+        gid = self._post(self.teacher, '/api/groups', {'name': '新组'}).get_json()['id']
+        self.assertTrue(self._get(self.teacher, '/api/groups').get_json()['items'][0]['inviteCode'].startswith('G'))
+
+    def test_group_invite_flow(self):
+        res = self._post(self.teacher, '/api/groups/g1/invites', {'userId': 'u4'})
+        self.assertEqual(res.status_code, 201)
+        invite_id = res.get_json()['id']
+        # 重复发送 -> 409
+        res = self._post(self.teacher, '/api/groups/g1/invites', {'userId': 'u4'})
+        self.assert_error(res, 409, 'ALREADY_INVITED')
+        # 目标为老师 -> 400
+        res = self._post(self.teacher, '/api/groups/g1/invites', {'userId': 't1'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 非管理教师不能发邀请
+        t2 = self.register_teacher()
+        res = self._post(t2, '/api/groups/g1/invites', {'userId': 'u4'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 学生端看到待处理邀请（含组名与邀请老师）
+        invites = self._get(self.student4, '/api/groups/invites').get_json()['items']
+        self.assertEqual(len(invites), 1)
+        self.assertEqual(invites[0]['groupName'], '火星能源课题小组')
+        self.assertEqual(invites[0]['inviterName'], '王老师')
+        # 老师端看到邀请中
+        pending = self._get(self.teacher, '/api/groups/g1/invites').get_json()['items']
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['username'], 'student4')
+        # 通过 -> 入组
+        res = self._post(self.student4, f'/api/groups/invites/{invite_id}/respond', {'accept': True})
+        self.assertEqual(res.get_json()['status'], 'accepted')
+        mine = self._get(self.student4, '/api/groups/mine').get_json()['items']
+        self.assertIn('g1', [g['id'] for g in mine])
+        # 已处理邀请不再出现
+        invites = self._get(self.student4, '/api/groups/invites').get_json()['items']
+        self.assertEqual(invites, [])
+        # 非布尔 accept -> 400
+        res = self.client.post('/api/users', json={
+            'username': 'newbie', 'password': '123456', 'name': '新人', 'role': 'student',
+        })
+        self.assertEqual(res.status_code, 201)
+        newbie = self._login('newbie', '123456')
+        res = self._post(self.teacher, '/api/groups/g1/invites', {'userId': newbie['user']['id']})
+        invite_id2 = res.get_json()['id']
+        res = self._post(newbie, f'/api/groups/invites/{invite_id2}/respond', {'accept': 'yes'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 不能替他人处理邀请
+        res = self._post(self.student, f'/api/groups/invites/{invite_id2}/respond', {'accept': True})
+        self.assert_error(res, 404, 'NOT_FOUND')
+
+    def test_group_invite_decline_and_withdraw(self):
+        # 拒绝 -> 不入组
+        res = self._post(self.teacher, '/api/groups/g1/invites', {'userId': 'u4'})
+        invite_id = res.get_json()['id']
+        res = self._post(self.student4, f'/api/groups/invites/{invite_id}/respond', {'accept': False})
+        self.assertEqual(res.get_json()['status'], 'declined')
+        mine = self._get(self.student4, '/api/groups/mine').get_json()['items']
+        self.assertNotIn('g1', [g['id'] for g in mine])
+        # 重复处理 -> 404
+        res = self._post(self.student4, f'/api/groups/invites/{invite_id}/respond', {'accept': True})
+        self.assert_error(res, 404, 'NOT_FOUND')
+        # 老师撤回
+        res = self._post(self.teacher, '/api/groups/g1/invites', {'userId': 'u4'})
+        invite_id = res.get_json()['id']
+        res = self._delete(self.teacher, f'/api/groups/g1/invites/{invite_id}')
+        self.assertEqual(res.status_code, 204)
+        pending = self._get(self.teacher, '/api/groups/g1/invites').get_json()['items']
+        self.assertEqual(pending, [])
+        # 撤回已处理的邀请 -> 404
+        res = self._delete(self.teacher, f'/api/groups/g1/invites/{invite_id}')
+        self.assert_error(res, 404, 'NOT_FOUND')
+
+    def test_project_group_scoping(self):
+        # 学生创建项目自动归入所在组（u1 在 g1）
+        p = self.create_project(self.student, 'topic2', '组内新项目')
+        self.assertEqual(p['groupId'], 'g1')
+        self.assertEqual(p['group'], {'id': 'g1', 'name': '火星能源课题小组'})
+        # 未分组学生创建 -> 公共项目
+        p2 = self.create_project(self.student4, 'topic2', '公共项目')
+        self.assertIsNone(p2['groupId'])
+        # 同组成员（未加入）可见组内项目；跨组不可见
+        res = self._get(self.student2, '/api/projects')
+        ids = [x['id'] for x in res.get_json()['items']]
+        self.assertIn(p['id'], ids)
+        self.assertIn(p2['id'], ids)  # 公共项目也可见
+        res = self._get(self.student4, '/api/projects')
+        ids = [x['id'] for x in res.get_json()['items']]
+        self.assertNotIn('p1', ids)
+        self.assertIn(p2['id'], ids)
+        # 跨组详情 -> 403
+        res = self._get(self.student4, '/api/projects/p1')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 同组一键加入
+        res = self._post(self.student2, f'/api/projects/{p["id"]}/join')
+        self.assertEqual(res.status_code, 201)
+        # 重复加入 -> 409
+        res = self._post(self.student2, f'/api/projects/{p["id"]}/join')
+        self.assert_error(res, 409, 'ALREADY_MEMBER')
+        # 跨组一键加入 -> 403
+        res = self._post(self.student4, f'/api/projects/{p["id"]}/join')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 教师一键加入 -> 403
+        res = self._post(self.teacher, f'/api/projects/{p2["id"]}/join')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 公共项目任意学生可加入
+        res = self._post(self.student2, f'/api/projects/{p2["id"]}/join')
+        self.assertEqual(res.status_code, 201)
+
+    def test_teacher_projects_group_filter(self):
+        # 默认：我管理的组 + 公共
+        res = self._get(self.teacher, '/api/teacher/projects')
+        ids = [p['id'] for p in res.get_json()['items']]
+        self.assertEqual(ids, ['p1', 'p2'])
+        # 按组筛选
+        res = self._get(self.teacher, '/api/teacher/projects?group=g1')
+        ids = [p['id'] for p in res.get_json()['items']]
+        self.assertEqual(ids, ['p1', 'p2'])
+        # 非管理的组 -> 403
+        gid = self._post(self.teacher, '/api/groups', {'name': '新组'}).get_json()['id']
+        t2 = self.register_teacher()
+        res = self._get(t2, f'/api/teacher/projects?group={gid}')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 学生访问 -> 403
+        res = self._get(self.student, '/api/teacher/projects?group=g1')
+        self.assert_error(res, 403, 'FORBIDDEN')
 
     # ------------------------------------------------------------ 通用约定
 

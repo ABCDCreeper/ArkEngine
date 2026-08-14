@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS topics (
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   topicId TEXT NOT NULL,
+  groupId TEXT,
   name TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('active', 'finished')),
   inviteCode TEXT NOT NULL UNIQUE,
@@ -147,6 +148,7 @@ CREATE TABLE IF NOT EXISTS groups (
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   quizMode TEXT NOT NULL DEFAULT 'group' CHECK (quizMode IN ('group', 'fallback', 'mixed')),
+  inviteCode TEXT NOT NULL DEFAULT '',
   createdAt TEXT NOT NULL,
   updatedAt TEXT NOT NULL
 );
@@ -157,6 +159,15 @@ CREATE TABLE IF NOT EXISTS group_members (
   role TEXT NOT NULL CHECK (role IN ('teacher', 'member')),
   joinedAt TEXT NOT NULL,
   UNIQUE (groupId, userId)
+);
+CREATE TABLE IF NOT EXISTS group_invites (
+  id TEXT PRIMARY KEY,
+  groupId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  inviterId TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'declined')),
+  createdAt TEXT NOT NULL,
+  respondedAt TEXT
 );
 -- 服务端会话（登录签发，登出删除，实现 token 失效）
 CREATE TABLE IF NOT EXISTS sessions (
@@ -192,6 +203,14 @@ def days_ago(days: int, hour: int = 10, minute: int = 0) -> str:
 def gen_id(prefix: str) -> str:
     """生成运行时新资源 ID：前缀 + 6 位随机字符（如 p3f9k2a）。"""
     return prefix + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+
+
+def gen_group_invite_code() -> str:
+    """生成全局唯一的用户组邀请码（如 G-KM3X 风格）。"""
+    while True:
+        code = 'G' + ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+        if not query_one('SELECT 1 FROM groups WHERE inviteCode = ?', (code,)):
+            return code
 
 
 # ---------------------------------------------------------------- 连接管理
@@ -264,8 +283,8 @@ _seed_topics = [
 ]
 
 _seed_projects = [
-    ('p1', 'topic1', '火星基地能源方案', 'active', 'P1-7F3A', 'u1', days_ago(12), days_ago(0, 9), None),
-    ('p2', 'topic2', '校园智能垃圾分类助手', 'finished', 'P2-9B1C', 'u1', days_ago(40), days_ago(6, 16), days_ago(6, 17)),
+    ('p1', 'topic1', 'g1', '火星基地能源方案', 'active', 'P1-7F3A', 'u1', days_ago(12), days_ago(0, 9), None),
+    ('p2', 'topic2', 'g1', '校园智能垃圾分类助手', 'finished', 'P2-9B1C', 'u1', days_ago(40), days_ago(6, 16), days_ago(6, 17)),
 ]
 
 _seed_members = [
@@ -429,7 +448,7 @@ _seed_quiz_questions = [
 ]
 
 _seed_groups = [
-    ('g1', '火星能源课题小组', '火星基地能源课题的同学们，由指导老师负责出题。', 'fallback', days_ago(10), days_ago(10)),
+    ('g1', '火星能源课题小组', '火星基地能源课题的同学们，由指导老师负责出题。', 'fallback', 'G1-KM3X', days_ago(10), days_ago(10)),
 ]
 
 _seed_group_members = [
@@ -472,8 +491,8 @@ def seed(db: sqlite3.Connection) -> None:
         [(t[0], t[1], t[2], json_dumps(t[3]), json_dumps(t[4]), t[5]) for t in _seed_topics],
     )
     db.executemany(
-        'INSERT INTO projects (id, topicId, name, status, inviteCode, leaderId, createdAt, updatedAt, finishedAt) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO projects (id, topicId, groupId, name, status, inviteCode, leaderId, createdAt, updatedAt, finishedAt) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         _seed_projects,
     )
     db.executemany('INSERT INTO members (id, projectId, userId, joinedAt) VALUES (?, ?, ?, ?)', _seed_members)
@@ -511,7 +530,8 @@ def seed(db: sqlite3.Connection) -> None:
         _seed_annotations,
     )
     db.executemany(
-        'INSERT INTO groups (id, name, description, quizMode, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO groups (id, name, description, quizMode, inviteCode, createdAt, updatedAt) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?)',
         _seed_groups,
     )
     db.executemany(
@@ -558,7 +578,8 @@ def seed_quiz_group(db: sqlite3.Connection) -> None:
 def seed_groups(db: sqlite3.Connection) -> None:
     """写入演示用户组与成员（独立于主种子，保证既有数据库也能补齐）。"""
     db.executemany(
-        'INSERT INTO groups (id, name, description, quizMode, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO groups (id, name, description, quizMode, inviteCode, createdAt, updatedAt) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?)',
         _seed_groups,
     )
     db.executemany(
@@ -586,6 +607,17 @@ def init_db() -> None:
         if col not in qcols:
             db.execute(f'ALTER TABLE quiz_questions ADD COLUMN {col} {ddl}')
             db.commit()
+    gcols = [r['name'] for r in db.execute('PRAGMA table_info(groups)').fetchall()]
+    if 'inviteCode' not in gcols:
+        db.execute("ALTER TABLE groups ADD COLUMN inviteCode TEXT NOT NULL DEFAULT ''")
+        db.commit()
+    pcols = [r['name'] for r in db.execute('PRAGMA table_info(projects)').fetchall()]
+    if 'groupId' not in pcols:
+        db.execute('ALTER TABLE projects ADD COLUMN groupId TEXT')
+        db.commit()
+    for g in query_all("SELECT id FROM groups WHERE inviteCode = ''"):
+        execute('UPDATE groups SET inviteCode = ? WHERE id = ?', (gen_group_invite_code(), g['id']))
+        db.commit()
     if not query_one('SELECT 1 FROM users LIMIT 1'):
         seed(db)
     if not query_one('SELECT 1 FROM groups LIMIT 1'):

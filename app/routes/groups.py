@@ -2,7 +2,7 @@
 from flask import Blueprint, g, jsonify, request
 
 from ..auth import require_auth
-from ..db import commit, execute, gen_id, json_dumps, json_loads, now_iso, query_all, query_one
+from ..db import commit, execute, gen_group_invite_code, gen_id, json_dumps, json_loads, now_iso, query_all, query_one
 from ..errors import ApiError, bad_request, forbidden, not_found
 
 bp = Blueprint('groups', __name__)
@@ -35,6 +35,7 @@ def group_view(group: dict) -> dict:
         **group,
         'memberCount': query_one('SELECT COUNT(*) AS c FROM group_members WHERE groupId = ?', (group['id'],))['c'],
         'questionCount': query_one('SELECT COUNT(*) AS c FROM quiz_questions WHERE groupId = ?', (group['id'],))['c'],
+        'projectCount': query_one('SELECT COUNT(*) AS c FROM projects WHERE groupId = ?', (group['id'],))['c'],
     }
 
 
@@ -89,9 +90,9 @@ def list_groups():
 @bp.get('/groups/mine')
 @require_auth
 def my_groups():
-    """学生：我所在的用户组列表。"""
+    """学生：我所在的用户组列表（含抽题机制，多组并列）。"""
     rows = query_all(
-        'SELECT g.id, g.name FROM group_members gm JOIN groups g ON g.id = gm.groupId '
+        'SELECT g.id, g.name, g.quizMode FROM group_members gm JOIN groups g ON g.id = gm.groupId '
         "WHERE gm.userId = ? AND gm.role = 'member' ORDER BY g.name",
         (g.user['id'],),
     )
@@ -112,8 +113,9 @@ def create_group():
     group_id = gen_id('g')
     ts = now_iso()
     execute(
-        'INSERT INTO groups (id, name, description, quizMode, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
-        (group_id, name, str(body.get('description', ''))[:200], mode, ts, ts),
+        'INSERT INTO groups (id, name, description, quizMode, inviteCode, createdAt, updatedAt) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+        (group_id, name, str(body.get('description', ''))[:200], mode, gen_group_invite_code(), ts, ts),
     )
     execute(
         "INSERT INTO group_members (id, groupId, userId, role, joinedAt) VALUES (?, ?, ?, 'teacher', ?)",
@@ -290,6 +292,147 @@ def delete_question(group_id, question_id):
     execute('DELETE FROM quiz_questions WHERE id = ?', (question_id,))
     commit()
     return '', 204
+
+
+# ---------------------------------------------------------------- 邀请
+
+@bp.post('/groups/join')
+@require_auth
+def join_group():
+    """学生凭邀请码直接入组（契约 3.11）。"""
+    if g.user['role'] != 'student':
+        raise forbidden('仅学生可通过邀请码加入分组')
+    body = request.get_json(silent=True) or {}
+    code = str(body.get('inviteCode') or '').strip()
+    group = query_one('SELECT * FROM groups WHERE inviteCode = ? COLLATE NOCASE', (code,))
+    if not group:
+        raise ApiError(409, 'INVALID_INVITE', '邀请码无效')
+    if query_one('SELECT 1 FROM group_members WHERE groupId = ? AND userId = ?', (group['id'], g.user['id'])):
+        raise ApiError(409, 'ALREADY_MEMBER', '你已在该分组中')
+    execute(
+        'INSERT INTO group_members (id, groupId, userId, role, joinedAt) VALUES (?, ?, ?, ?, ?)',
+        (gen_id('gm'), group['id'], g.user['id'], 'member', now_iso()),
+    )
+    commit()
+    return jsonify(group_view(get_group_or_404(group['id']))), 201
+
+
+@bp.post('/groups/<group_id>/invites')
+@require_auth
+def send_invite(group_id):
+    """负责老师给学生发送入组邀请（契约 3.11）。"""
+    require_teacher()
+    get_group_or_404(group_id)
+    require_manager(group_id)
+    body = request.get_json(silent=True) or {}
+    user_id = body.get('userId')
+    if not isinstance(user_id, str):
+        raise bad_request('userId 不能为空')
+    user = query_one('SELECT id, role FROM users WHERE id = ?', (user_id,))
+    if not user:
+        raise not_found('用户不存在')
+    if user['role'] != 'student':
+        raise bad_request('负责老师请直接添加，邀请仅面向学生')
+    if query_one('SELECT 1 FROM group_members WHERE groupId = ? AND userId = ?', (group_id, user_id)):
+        raise ApiError(409, 'ALREADY_MEMBER', '该用户已在组内')
+    if query_one(
+        "SELECT 1 FROM group_invites WHERE groupId = ? AND userId = ? AND status = 'pending'",
+        (group_id, user_id),
+    ):
+        raise ApiError(409, 'ALREADY_INVITED', '已发送过邀请，等待学生确认')
+    invite = {
+        'id': gen_id('gi'),
+        'groupId': group_id,
+        'userId': user_id,
+        'inviterId': g.user['id'],
+        'status': 'pending',
+        'createdAt': now_iso(),
+        'respondedAt': None,
+    }
+    execute(
+        'INSERT INTO group_invites (id, groupId, userId, inviterId, status, createdAt, respondedAt) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+        tuple(invite.values()),
+    )
+    commit()
+    return jsonify(invite), 201
+
+
+@bp.get('/groups/<group_id>/invites')
+@require_auth
+def list_invites(group_id):
+    """负责老师查看组内待处理邀请。"""
+    require_teacher()
+    get_group_or_404(group_id)
+    require_manager(group_id)
+    rows = query_all(
+        'SELECT gi.id, gi.groupId, gi.userId, gi.inviterId, gi.status, gi.createdAt, u.name, u.username '
+        'FROM group_invites gi JOIN users u ON u.id = gi.userId '
+        "WHERE gi.groupId = ? AND gi.status = 'pending' ORDER BY gi.createdAt",
+        (group_id,),
+    )
+    return jsonify({'items': rows, 'total': len(rows)})
+
+
+@bp.delete('/groups/<group_id>/invites/<invite_id>')
+@require_auth
+def withdraw_invite(group_id, invite_id):
+    """负责老师撤回待处理邀请。"""
+    require_teacher()
+    get_group_or_404(group_id)
+    require_manager(group_id)
+    row = query_one(
+        "SELECT id FROM group_invites WHERE id = ? AND groupId = ? AND status = 'pending'",
+        (invite_id, group_id),
+    )
+    if not row:
+        raise not_found('邀请不存在或已处理')
+    execute('DELETE FROM group_invites WHERE id = ?', (invite_id,))
+    commit()
+    return '', 204
+
+
+@bp.get('/groups/invites')
+@require_auth
+def my_invites():
+    """学生：我的待处理入组邀请（含组名与邀请老师）。"""
+    rows = query_all(
+        'SELECT gi.id, gi.groupId, gi.status, gi.createdAt, g.name AS groupName, u.name AS inviterName '
+        'FROM group_invites gi JOIN groups g ON g.id = gi.groupId JOIN users u ON u.id = gi.inviterId '
+        "WHERE gi.userId = ? AND gi.status = 'pending' ORDER BY gi.createdAt",
+        (g.user['id'],),
+    )
+    return jsonify({'items': rows, 'total': len(rows)})
+
+
+@bp.post('/groups/invites/<invite_id>/respond')
+@require_auth
+def respond_invite(invite_id):
+    """学生：通过（入组）或拒绝邀请。"""
+    body = request.get_json(silent=True) or {}
+    accept = body.get('accept')
+    if not isinstance(accept, bool):
+        raise bad_request('accept 需为布尔值')
+    invite = query_one(
+        "SELECT * FROM group_invites WHERE id = ? AND userId = ? AND status = 'pending'",
+        (invite_id, g.user['id']),
+    )
+    if not invite:
+        raise not_found('邀请不存在或已处理')
+    if accept:
+        if not query_one('SELECT 1 FROM group_members WHERE groupId = ? AND userId = ?',
+                         (invite['groupId'], invite['userId'])):
+            execute(
+                'INSERT INTO group_members (id, groupId, userId, role, joinedAt) VALUES (?, ?, ?, ?, ?)',
+                (gen_id('gm'), invite['groupId'], invite['userId'], 'member', now_iso()),
+            )
+        execute("UPDATE group_invites SET status = 'accepted', respondedAt = ? WHERE id = ?",
+                (now_iso(), invite_id))
+    else:
+        execute("UPDATE group_invites SET status = 'declined', respondedAt = ? WHERE id = ?",
+                (now_iso(), invite_id))
+    commit()
+    return jsonify({'status': 'accepted' if accept else 'declined'})
 
 
 # ---------------------------------------------------------------- 用户搜索

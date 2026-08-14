@@ -1,10 +1,10 @@
 """教师端与成果归档路由（契约 3.8 / 3.9）：团队总览、批注、科创档案。"""
 from datetime import datetime
 
-from flask import Blueprint, g, jsonify
+from flask import Blueprint, g, jsonify, request
 
 from ..auth import require_auth
-from ..db import commit, execute, gen_id, now_iso, query_all
+from ..db import commit, execute, gen_id, now_iso, query_all, query_one
 from ..errors import ApiError, bad_request, forbidden, get_json_body
 from ..services import (
     ensure_read_access,
@@ -20,10 +20,24 @@ bp = Blueprint('teacher', __name__)
 @bp.get('/teacher/projects')
 @require_auth
 def teacher_projects():
-    """全部团队总览（仅教师），按最近更新倒序（契约 3.8）。"""
+    """团队总览（仅教师）：默认我管理的组 + 公共项目；?group=<id> 只看该组（契约 3.8）。"""
     if g.user['role'] != 'teacher':
         raise forbidden('仅教师可访问')
-    rows = query_all('SELECT * FROM projects ORDER BY updatedAt DESC')
+    group_id = request.args.get('group')
+    if group_id:
+        if not query_one(
+            "SELECT 1 FROM group_members WHERE groupId = ? AND userId = ? AND role = 'teacher'",
+            (group_id, g.user['id']),
+        ):
+            raise forbidden('仅可查看自己管理的组')
+        rows = query_all('SELECT * FROM projects WHERE groupId = ? ORDER BY updatedAt DESC', (group_id,))
+    else:
+        rows = query_all(
+            'SELECT * FROM projects WHERE groupId IS NULL OR groupId IN '
+            "(SELECT groupId FROM group_members WHERE userId = ? AND role = 'teacher') "
+            'ORDER BY updatedAt DESC',
+            (g.user['id'],),
+        )
     return jsonify(paged([project_view(p) for p in rows]))
 
 

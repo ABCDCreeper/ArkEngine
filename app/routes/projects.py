@@ -6,7 +6,7 @@ from flask import Blueprint, g, jsonify
 
 from ..auth import require_auth
 from ..db import commit, execute, gen_id, now_iso, query_all, query_one
-from ..errors import ApiError, bad_request, get_json_body
+from ..errors import ApiError, bad_request, forbidden, get_json_body
 from ..services import (
     add_feedback,
     ensure_read_access,
@@ -38,10 +38,16 @@ def list_topics():
 @bp.get('/projects')
 @require_auth
 def list_projects():
-    """当前用户参与的项目（教师无成员关系，返回空数组，契约 3.2）。"""
+    """学生可见项目：我加入的 + 公共的 + 我所在组的（教师返回空，走团队总览）。"""
+    if g.user['role'] == 'teacher':
+        return jsonify(paged([]))
     rows = query_all(
-        'SELECT p.* FROM members m JOIN projects p ON p.id = m.projectId WHERE m.userId = ?',
-        (g.user['id'],),
+        'SELECT DISTINCT p.* FROM projects p WHERE '
+        "p.id IN (SELECT projectId FROM members WHERE userId = ?) "
+        "OR p.groupId IS NULL "
+        "OR p.groupId IN (SELECT groupId FROM group_members WHERE userId = ? AND role = 'member') "
+        'ORDER BY p.updatedAt DESC',
+        (g.user['id'], g.user['id']),
     )
     return jsonify(paged([project_view(p) for p in rows]))
 
@@ -49,15 +55,20 @@ def list_projects():
 @bp.post('/projects')
 @require_auth
 def create_project():
-    """发起项目：自动成为组长并加入成员、生成邀请码、初始化根导图节点。"""
+    """发起项目：自动归入创建者所在组（首个组）、成为组长、生成邀请码、初始化根导图节点。"""
     body = get_json_body()
     topic = query_one('SELECT * FROM topics WHERE id = ?', (body.get('topicId'),))
     if not topic:
         raise bad_request('课题不存在')
     now = now_iso()
+    group = query_one(
+        "SELECT groupId FROM group_members WHERE userId = ? AND role = 'member' ORDER BY joinedAt LIMIT 1",
+        (g.user['id'],),
+    )
     project = {
         'id': gen_id('p'),
         'topicId': topic['id'],
+        'groupId': group['groupId'] if group else None,
         'name': body.get('name') or topic['title'],
         'status': 'active',
         'inviteCode': gen_invite_code(),
@@ -67,8 +78,8 @@ def create_project():
         'finishedAt': None,
     }
     execute(
-        'INSERT INTO projects (id, topicId, name, status, inviteCode, leaderId, createdAt, updatedAt, finishedAt) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO projects (id, topicId, groupId, name, status, inviteCode, leaderId, createdAt, updatedAt, finishedAt) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         tuple(project.values()),
     )
     execute('INSERT INTO members (id, projectId, userId, joinedAt) VALUES (?, ?, ?, ?)',
@@ -82,7 +93,9 @@ def create_project():
 @bp.post('/projects/join')
 @require_auth
 def join_project():
-    """邀请码加入：无效 / 已加入 / 满员分别返回 409（契约 3.2）。"""
+    """邀请码加入：仅学生；无效 / 已加入 / 满员返回 409；跨组项目拒绝（契约 3.2）。"""
+    if g.user['role'] != 'student':
+        raise forbidden('仅学生可加入项目')
     body = get_json_body()
     code = str(body.get('inviteCode') or '').strip()
     project = query_one('SELECT * FROM projects WHERE inviteCode = ? COLLATE NOCASE', (code,))
@@ -90,6 +103,34 @@ def join_project():
         raise ApiError(409, 'INVALID_INVITE', '邀请码无效')
     if query_one('SELECT 1 FROM members WHERE projectId = ? AND userId = ?', (project['id'], g.user['id'])):
         raise ApiError(409, 'ALREADY_MEMBER', '你已在该项目中')
+    if project['groupId'] is not None and not query_one(
+        "SELECT 1 FROM group_members WHERE groupId = ? AND userId = ? AND role = 'member'",
+        (project['groupId'], g.user['id']),
+    ):
+        raise forbidden('仅本组成员可加入该项目')
+    count = query_one('SELECT COUNT(*) AS c FROM members WHERE projectId = ?', (project['id'],))['c']
+    if count >= 4:
+        raise ApiError(409, 'TEAM_FULL', '队伍已满（最多 4 人）')
+    execute('INSERT INTO members (id, projectId, userId, joinedAt) VALUES (?, ?, ?, ?)',
+            (gen_id('m'), project['id'], g.user['id'], now_iso()))
+    commit()
+    return jsonify(project_view(get_project_or_404(project['id']))), 201
+
+
+@bp.post('/projects/<project_id>/join')
+@require_auth
+def join_project_direct(project_id):
+    """同组/公共项目一键加入（仅学生）。"""
+    project = get_project_or_404(project_id)
+    if g.user['role'] != 'student':
+        raise forbidden('仅学生可加入项目')
+    if query_one('SELECT 1 FROM members WHERE projectId = ? AND userId = ?', (project['id'], g.user['id'])):
+        raise ApiError(409, 'ALREADY_MEMBER', '你已在该项目中')
+    if project['groupId'] is not None and not query_one(
+        "SELECT 1 FROM group_members WHERE groupId = ? AND userId = ? AND role = 'member'",
+        (project['groupId'], g.user['id']),
+    ):
+        raise forbidden('仅本组成员可加入该项目')
     count = query_one('SELECT COUNT(*) AS c FROM members WHERE projectId = ?', (project['id'],))['c']
     if count >= 4:
         raise ApiError(409, 'TEAM_FULL', '队伍已满（最多 4 人）')
