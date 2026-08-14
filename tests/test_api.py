@@ -507,6 +507,51 @@ class ApiTestCase(unittest.TestCase):
         res = self._get(self.teacher, '/api/projects/p1/tasks')
         self.assertEqual(res.status_code, 200)
 
+    # ------------------------------------------------------------ 知识闯关
+
+    def test_quiz_questions(self):
+        res = self.client.get('/api/quiz/questions')
+        self.assert_error(res, 401, 'UNAUTHORIZED')
+        res = self._get(self.student, '/api/quiz/questions?count=5')
+        body = res.get_json()
+        self.assertEqual(len(body['items']), 5)
+        self.assertGreaterEqual(body['total'], 20)
+        q = body['items'][0]
+        self.assertEqual(
+            set(q), {'id', 'category', 'difficulty', 'question', 'options', 'answer', 'explanation'})
+        self.assertEqual(len(q['options']), 4)
+        self.assertIsInstance(q['answer'], int)
+        # count 上限 20，非法值回落默认 10
+        res = self._get(self.student, '/api/quiz/questions?count=999')
+        self.assertEqual(len(res.get_json()['items']), 20)
+        res = self._get(self.student, '/api/quiz/questions?count=abc')
+        self.assertEqual(len(res.get_json()['items']), 10)
+
+    def test_quiz_attempts_and_stats(self):
+        res = self._post(self.student, '/api/quiz/attempts', {'score': 8, 'total': 10})
+        self.assertEqual(res.status_code, 201)
+        body = res.get_json()
+        self.assertEqual(body['attempt']['score'], 8)
+        self.assertEqual(body['best']['score'], 8)
+        res = self._post(self.student, '/api/quiz/attempts', {'score': 10, 'total': 10})
+        self.assertEqual(res.get_json()['best']['score'], 10)
+        stats = self._get(self.student, '/api/quiz/stats').get_json()
+        self.assertEqual(stats['attempts'], 2)
+        self.assertEqual(stats['best']['score'], 10)
+        self.assertEqual(stats['last']['score'], 10)
+        # 不同用户成绩互不干扰
+        self._post(self.student2, '/api/quiz/attempts', {'score': 2, 'total': 10})
+        stats = self._get(self.student, '/api/quiz/stats').get_json()
+        self.assertEqual(stats['attempts'], 2)
+
+    def test_quiz_attempt_validation(self):
+        for bad in ({'score': '8', 'total': 10}, {'score': 11, 'total': 10}, {'score': 5}, {'score': -1, 'total': 10}):
+            res = self._post(self.student, '/api/quiz/attempts', bad)
+            self.assert_error(res, 400, 'VALIDATION_ERROR')
+        stats = self._get(self.student, '/api/quiz/stats').get_json()
+        self.assertIsNone(stats['best'])
+        self.assertIsNone(stats['last'])
+
     # ------------------------------------------------------------ 通用约定
 
     def test_pagination_shape(self):
