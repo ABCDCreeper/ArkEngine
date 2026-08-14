@@ -269,6 +269,9 @@ _seed_users = [
     ('u3', 'student3', '123456', '王五', 'student'),
     ('u4', 'student4', '123456', '赵六', 'student'),
     ('t1', 'teacher', '123456', '王老师', 'teacher'),
+]
+
+_seed_admin_users = [
     ('sa1', 'superadmin', '123456', '系统管理员', 'superadmin'),
     ('ad1', 'admin', '123456', '平台管理员', 'admin'),
     ('sc1', 'schooladmin', '123456', '校管理员', 'schooladmin'),
@@ -592,6 +595,17 @@ def seed_groups(db: sqlite3.Connection) -> None:
     db.commit()
 
 
+def seed_admin_users(db: sqlite3.Connection) -> None:
+    """写入管理角色演示账号（superadmin/admin/schooladmin，密码 123456）。"""
+    from werkzeug.security import generate_password_hash
+
+    db.executemany(
+        'INSERT INTO users (id, username, password, name, role) VALUES (?, ?, ?, ?, ?)',
+        [(u[0], u[1], generate_password_hash(u[2]), u[3], u[4]) for u in _seed_admin_users],
+    )
+    db.commit()
+
+
 def init_db() -> None:
     """建表（含轻量迁移）；users 为空时写入种子数据。"""
     db = get_db()
@@ -634,6 +648,8 @@ def init_db() -> None:
         db.commit()
     if not query_one('SELECT 1 FROM users LIMIT 1'):
         seed(db)
+    if not query_one("SELECT 1 FROM users WHERE role = 'superadmin' LIMIT 1"):
+        seed_admin_users(db)
     if not query_one('SELECT 1 FROM groups LIMIT 1'):
         seed_groups(db)
     if not query_one('SELECT 1 FROM quiz_questions WHERE groupId IS NULL LIMIT 1'):
