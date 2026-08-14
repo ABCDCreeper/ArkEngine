@@ -740,7 +740,7 @@ class ApiTestCase(unittest.TestCase):
         self.assertIn('quizMode', mine[0])
         self.assertIn('questionCount', mine[0])
         # 新建的组会自动生成邀请码
-        gid = self._post(self.teacher, '/api/groups', {'name': '新组'}).get_json()['id']
+        self._post(self.teacher, '/api/groups', {'name': '新组'})
         self.assertTrue(self._get(self.teacher, '/api/groups').get_json()['items'][0]['inviteCode'].startswith('G'))
 
     def test_group_invite_flow(self):

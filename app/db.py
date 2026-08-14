@@ -643,8 +643,8 @@ def init_db() -> None:
     if 'groupId' not in pcols:
         db.execute('ALTER TABLE projects ADD COLUMN groupId TEXT')
         db.commit()
-    for g in query_all("SELECT id FROM groups WHERE inviteCode = ''"):
-        execute('UPDATE groups SET inviteCode = ? WHERE id = ?', (gen_group_invite_code(), g['id']))
+    for grp in query_all("SELECT id FROM groups WHERE inviteCode = ''"):
+        execute('UPDATE groups SET inviteCode = ? WHERE id = ?', (gen_group_invite_code(), grp['id']))
         db.commit()
     if not query_one('SELECT 1 FROM users LIMIT 1'):
         seed(db)
