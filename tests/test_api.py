@@ -68,6 +68,13 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(res.status_code, 201, res.get_json())
         return res.get_json()
 
+    def register_teacher(self, username='tea2'):
+        res = self.client.post('/api/users', json={
+            'username': username, 'password': '123456', 'name': '李老师', 'role': 'teacher',
+        })
+        self.assertEqual(res.status_code, 201, res.get_json())
+        return self._login(username, '123456')
+
     # ------------------------------------------------------------ 认证
 
     def test_register_success(self):
@@ -518,7 +525,10 @@ class ApiTestCase(unittest.TestCase):
         self.assertGreaterEqual(body['total'], 20)
         q = body['items'][0]
         self.assertEqual(
-            set(q), {'id', 'category', 'difficulty', 'question', 'options', 'answer', 'explanation'})
+            set(q),
+            {'id', 'groupId', 'createdBy', 'createdAt', 'updatedAt', 'category', 'difficulty',
+             'question', 'options', 'answer', 'explanation'})
+        self.assertIsNone(q['groupId'])
         self.assertEqual(len(q['options']), 4)
         self.assertIsInstance(q['answer'], int)
         # count 上限 20，非法值回落默认 10
@@ -551,6 +561,156 @@ class ApiTestCase(unittest.TestCase):
         stats = self._get(self.student, '/api/quiz/stats').get_json()
         self.assertIsNone(stats['best'])
         self.assertIsNone(stats['last'])
+
+    # ------------------------------------------------------------ 用户组与题库
+
+    def test_group_crud(self):
+        res = self._post(self.student, '/api/groups', {'name': '测试组'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        res = self._post(self.teacher, '/api/groups', {'name': '测试组', 'description': '描述', 'quizMode': 'mixed'})
+        self.assertEqual(res.status_code, 201)
+        g = res.get_json()
+        self.assertEqual(g['name'], '测试组')
+        self.assertEqual(g['quizMode'], 'mixed')
+        self.assertEqual(g['memberCount'], 1)  # 创建者自动成为负责老师
+        gid = g['id']
+        # 非法 quizMode -> 400
+        res = self._post(self.teacher, '/api/groups', {'name': '坏组', 'quizMode': 'xxx'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        res = self._patch(self.teacher, f'/api/groups/{gid}', {'name': '测试组2', 'quizMode': 'fallback'})
+        body = res.get_json()
+        self.assertEqual(body['name'], '测试组2')
+        self.assertEqual(body['quizMode'], 'fallback')
+        self.assertEqual(len(self._get(self.teacher, '/api/groups').get_json()['items']), 2)  # g1 + 新组
+        # 非管理教师不可改名
+        t2 = self.register_teacher()
+        res = self._patch(t2, f'/api/groups/{gid}', {'name': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 删除连带清空成员与组内题目
+        self._post(self.teacher, f'/api/groups/{gid}/members', {'userId': 'u4', 'role': 'member'})
+        res = self._delete(self.teacher, f'/api/groups/{gid}')
+        self.assertEqual(res.status_code, 204)
+        res = self._get(self.teacher, f'/api/groups/{gid}/members')
+        self.assert_error(res, 404, 'GROUP_NOT_FOUND')
+
+    def test_group_members(self):
+        gid = self._post(self.teacher, '/api/groups', {'name': '成员测试组'}).get_json()['id']
+        # 添加学生与第二个负责老师
+        res = self._post(self.teacher, f'/api/groups/{gid}/members', {'userId': 'u4', 'role': 'member'})
+        self.assertEqual(res.status_code, 201)
+        t2 = self.register_teacher()
+        res = self._post(self.teacher, f'/api/groups/{gid}/members', {'userId': t2['user']['id'], 'role': 'teacher'})
+        self.assertEqual(res.status_code, 201)
+        # 重复添加 -> 409
+        res = self._post(self.teacher, f'/api/groups/{gid}/members', {'userId': 'u4', 'role': 'member'})
+        self.assert_error(res, 409, 'ALREADY_MEMBER')
+        # 不存在的用户 -> 404
+        res = self._post(self.teacher, f'/api/groups/{gid}/members', {'userId': 'nobody', 'role': 'member'})
+        self.assert_error(res, 404, 'NOT_FOUND')
+        # 学生可同时在多个组（u4 已在 gid，再加入 g2）
+        g2 = self._post(self.teacher, '/api/groups', {'name': '第二组'}).get_json()['id']
+        self._post(self.teacher, f'/api/groups/{g2}/members', {'userId': 'u4', 'role': 'member'})
+        mine = self._get(self.student4, '/api/groups/mine').get_json()['items']
+        self.assertEqual(len(mine), 2)
+        # 非管理教师不可加人
+        res = self._post(t2, f'/api/groups/{g2}/members', {'userId': 'u2', 'role': 'member'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 移除最后一个负责老师被拒
+        res = self._delete(self.teacher, f'/api/groups/{g2}/members/t1')
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 移除不存在的成员 -> 404
+        res = self._delete(self.teacher, f'/api/groups/{gid}/members/u2')
+        self.assert_error(res, 404, 'NOT_FOUND')
+        # 正常移除成员
+        res = self._delete(self.teacher, f'/api/groups/{gid}/members/u4')
+        self.assertEqual(res.status_code, 204)
+        members = self._get(self.teacher, f'/api/groups/{gid}/members').get_json()['items']
+        self.assertNotIn('u4', [m['userId'] for m in members])
+
+    def test_group_questions_crud(self):
+        gid = self._post(self.teacher, '/api/groups', {'name': '题库测试组'}).get_json()['id']
+        body = {
+            'question': '测试题：火星日长约多少？', 'category': '物理', 'difficulty': 2,
+            'options': ['24 小时', '24 小时 39 分', '25 小时', '23 小时'], 'answer': 1,
+            'explanation': '火星一个太阳日约 24 小时 39 分。',
+        }
+        res = self._post(self.teacher, f'/api/groups/{gid}/questions', body)
+        self.assertEqual(res.status_code, 201)
+        q = res.get_json()
+        self.assertEqual(q['groupId'], gid)
+        self.assertEqual(q['options'][q['answer']], '24 小时 39 分')
+        self.assertEqual(q['createdBy'], 't1')
+        for bad in (
+            {**body, 'options': ['a', 'b']},
+            {**body, 'answer': 4},
+            {**body, 'question': '  '},
+            {**body, 'difficulty': 5},
+            {**body, 'explanation': ''},
+        ):
+            res = self._post(self.teacher, f'/api/groups/{gid}/questions', bad)
+            self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 非管理教师不可出题/改题
+        t2 = self.register_teacher()
+        res = self._post(t2, f'/api/groups/{gid}/questions', body)
+        self.assert_error(res, 403, 'FORBIDDEN')
+        qid = q['id']
+        res = self._patch(t2, f'/api/groups/{gid}/questions/{qid}', body)
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 更新与删除
+        res = self._patch(self.teacher, f'/api/groups/{gid}/questions/{qid}', {**body, 'question': '改过的题'})
+        self.assertEqual(res.get_json()['question'], '改过的题')
+        res = self._delete(self.teacher, f'/api/groups/{gid}/questions/{qid}')
+        self.assertEqual(res.status_code, 204)
+        items = self._get(self.teacher, f'/api/groups/{gid}/questions').get_json()['items']
+        self.assertEqual(items, [])
+
+    def test_quiz_questions_group_modes(self):
+        # g1 默认 fallback：组内 5 题，不混公共题
+        res = self._get(self.student, '/api/quiz/questions?group=g1&count=10')
+        body = res.get_json()
+        self.assertEqual(len(body['items']), 5)
+        self.assertEqual(body['group'], {'id': 'g1', 'name': '火星能源课题小组'})
+        self.assertTrue(all(q['groupId'] == 'g1' for q in body['items']))
+        # 非成员玩别人的组 -> 403
+        res = self._get(self.student4, '/api/quiz/questions?group=g1')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 未分组学生 -> 公共题库
+        res = self._get(self.student4, '/api/quiz/questions?count=5')
+        body = res.get_json()
+        self.assertEqual(len(body['items']), 5)
+        self.assertIsNone(body['group'])
+        self.assertTrue(all(q['groupId'] is None for q in body['items']))
+        # group 模式且组内为空 -> 空题库
+        gid = self._post(self.teacher, '/api/groups', {'name': '空题库组'}).get_json()['id']
+        self._post(self.teacher, f'/api/groups/{gid}/members', {'userId': 'u4', 'role': 'member'})
+        res = self._get(self.student4, f'/api/quiz/questions?group={gid}')
+        self.assertEqual(res.get_json()['items'], [])
+        # fallback 模式且组内为空 -> 回退公共题库
+        self._patch(self.teacher, f'/api/groups/{gid}', {'quizMode': 'fallback'})
+        res = self._get(self.student4, f'/api/quiz/questions?group={gid}&count=50')
+        items = res.get_json()['items']
+        self.assertEqual(len(items), 20)
+        self.assertTrue(all(q['groupId'] is None for q in items))
+        # mixed 模式 -> 组内与公共混合
+        self.assertEqual(self._post(self.teacher, f'/api/groups/{gid}/questions', {
+            'question': '混合模式测试题', 'category': '综合', 'difficulty': 1,
+            'options': ['A1', 'A2', 'A3', 'A4'], 'answer': 0, 'explanation': '混合模式说明',
+        }).status_code, 201)
+        self.assertEqual(self._patch(self.teacher, f'/api/groups/{gid}', {'quizMode': 'mixed'}).status_code, 200)
+        res = self._get(self.student4, f'/api/quiz/questions?group={gid}&count=50')
+        body = res.get_json()
+        self.assertEqual(len(body['items']), 20)  # 单次抽取上限 20
+        self.assertEqual(body['total'], 21)  # 20 公共 + 1 组内，证明混合
+        self.assertTrue(all(q['groupId'] in (None, gid) for q in body['items']))
+
+    def test_user_search(self):
+        res = self._get(self.student, '/api/users?keyword=张')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        res = self._get(self.teacher, '/api/users?keyword=张')
+        ids = [u['id'] for u in res.get_json()['items']]
+        self.assertIn('u1', ids)
+        res = self._get(self.teacher, '/api/users?keyword=不存在的名字')
+        self.assertEqual(res.get_json()['items'], [])
 
     # ------------------------------------------------------------ 通用约定
 

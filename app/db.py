@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS focus_sessions (
 );
 CREATE TABLE IF NOT EXISTS quiz_questions (
   id TEXT PRIMARY KEY,
+  groupId TEXT,
+  createdBy TEXT,
+  createdAt TEXT,
+  updatedAt TEXT,
   category TEXT NOT NULL,
   difficulty INTEGER NOT NULL DEFAULT 1,
   question TEXT NOT NULL,
@@ -137,6 +141,22 @@ CREATE TABLE IF NOT EXISTS quiz_attempts (
   score INTEGER NOT NULL DEFAULT 0,
   total INTEGER NOT NULL DEFAULT 0,
   createdAt TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS groups (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  quizMode TEXT NOT NULL DEFAULT 'group' CHECK (quizMode IN ('group', 'fallback', 'mixed')),
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members (
+  id TEXT PRIMARY KEY,
+  groupId TEXT NOT NULL,
+  userId TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('teacher', 'member')),
+  joinedAt TEXT NOT NULL,
+  UNIQUE (groupId, userId)
 );
 -- 服务端会话（登录签发，登出删除，实现 token 失效）
 CREATE TABLE IF NOT EXISTS sessions (
@@ -408,6 +428,36 @@ _seed_quiz_questions = [
      '科学探索中“失败”同样有价值：每排除一种假设，就离正确答案近一步——这就是科学方法。'),
 ]
 
+_seed_groups = [
+    ('g1', '火星能源课题小组', '火星基地能源课题的同学们，由指导老师负责出题。', 'fallback', days_ago(10), days_ago(10)),
+]
+
+_seed_group_members = [
+    ('gm1', 'g1', 't1', 'teacher', days_ago(10)),
+    ('gm2', 'g1', 'u1', 'member', days_ago(9)),
+    ('gm3', 'g1', 'u2', 'member', days_ago(8)),
+    ('gm4', 'g1', 'u3', 'member', days_ago(7)),
+]
+
+_seed_group_questions = [
+    # (id, groupId, createdBy, createdAt, updatedAt, category, difficulty, question, options, answer, explanation)
+    ('q21', 'g1', 't1', days_ago(9), days_ago(9), '物理', 1, '火星上的一个太阳日比地球的一天大约？',
+     ['差不多一样长', '长约 40 分钟', '短约 40 分钟', '长约 3 小时'], 1,
+     '火星自转周期约 24 小时 39 分，比地球多约 40 分钟——作息表得按火星时间重排。'),
+    ('q22', 'g1', 't1', days_ago(9), days_ago(9), '物理', 1, '火星大气的主要成分是？',
+     ['氧气', '氮气', '二氧化碳（约 95%）', '氦气'], 2,
+     '火星大气 95% 以上是二氧化碳，氧气含量不到 0.2%，所以基地必须自己产氧。'),
+    ('q23', 'g1', 't1', days_ago(8), days_ago(8), '物理', 2, '火星表面的重力约为地球的？',
+     ['约 1/8', '约 1/3', '约 1/2', '与地球相同'], 1,
+     '火星质量约为地球的 1/10，表面重力约 0.38g——跳起来能比地球高两倍多。'),
+    ('q24', 'g1', 't1', days_ago(8), days_ago(8), '工程', 2, '地球与火星的最近距离大约是多少？',
+     ['5500 万公里', '2 亿公里', '5 亿公里', '1 光年'], 0,
+     '两者最近约 5500 万公里（大概每 26 个月一次窗口期），信号单程就要 3 分钟以上。'),
+    ('q25', 'g1', 't1', days_ago(7), days_ago(7), '工程', 2, '火星着陆器进入大气层后，通常靠什么减速？',
+     ['降落伞 + 反推火箭', '直接撞击缓冲', '系绳吊放', '磁悬浮刹车'], 0,
+     '先靠大气摩擦减速，再开降落伞，最后反推火箭软着陆——好奇号用的就是这套组合。'),
+]
+
 
 def seed(db: sqlite3.Connection) -> None:
     """写入演示数据（镜像 InnoArk mock/db.ts 的种子，密码统一为 123456）。"""
@@ -460,6 +510,14 @@ def seed(db: sqlite3.Connection) -> None:
         'INSERT INTO annotations (id, projectId, userId, content, createdAt) VALUES (?, ?, ?, ?, ?)',
         _seed_annotations,
     )
+    db.executemany(
+        'INSERT INTO groups (id, name, description, quizMode, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+        _seed_groups,
+    )
+    db.executemany(
+        'INSERT INTO group_members (id, groupId, userId, role, joinedAt) VALUES (?, ?, ?, ?, ?)',
+        _seed_group_members,
+    )
     # 专注记录：u1 近 6 天每天 2~4 次番茄钟，u2/u3 各有少量记录
     for d in range(6, 0, -1):
         for _ in range(random.randint(2, 4)):
@@ -475,12 +533,37 @@ def seed(db: sqlite3.Connection) -> None:
     db.commit()
 
 
-def seed_quiz(db: sqlite3.Connection) -> None:
-    """写入知识闯关题库（独立于主种子，保证既有数据库也能补齐）。"""
+def seed_quiz_public(db: sqlite3.Connection) -> None:
+    """写入公共题库（无分组的用户与回退场景使用）。"""
     db.executemany(
         'INSERT INTO quiz_questions (id, category, difficulty, question, options, answer, explanation) '
         'VALUES (?, ?, ?, ?, ?, ?, ?)',
         [(q[0], q[1], q[2], q[3], json_dumps(q[4]), q[5], q[6]) for q in _seed_quiz_questions],
+    )
+    db.commit()
+
+
+def seed_quiz_group(db: sqlite3.Connection) -> None:
+    """写入演示组 g1 的组内题库（仅当 g1 存在时）。"""
+    if not query_one('SELECT 1 FROM groups WHERE id = ?', ('g1',)):
+        return
+    db.executemany(
+        'INSERT INTO quiz_questions (id, groupId, createdBy, createdAt, updatedAt, category, difficulty, '
+        'question, options, answer, explanation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [(q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], json_dumps(q[8]), q[9], q[10]) for q in _seed_group_questions],
+    )
+    db.commit()
+
+
+def seed_groups(db: sqlite3.Connection) -> None:
+    """写入演示用户组与成员（独立于主种子，保证既有数据库也能补齐）。"""
+    db.executemany(
+        'INSERT INTO groups (id, name, description, quizMode, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+        _seed_groups,
+    )
+    db.executemany(
+        'INSERT INTO group_members (id, groupId, userId, role, joinedAt) VALUES (?, ?, ?, ?, ?)',
+        _seed_group_members,
     )
     db.commit()
 
@@ -493,10 +576,24 @@ def init_db() -> None:
     if 'description' not in cols:
         db.execute("ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         db.commit()
+    qcols = [r['name'] for r in db.execute('PRAGMA table_info(quiz_questions)').fetchall()]
+    for col, ddl in (
+        ('groupId', 'TEXT'),
+        ('createdBy', 'TEXT'),
+        ('createdAt', 'TEXT'),
+        ('updatedAt', 'TEXT'),
+    ):
+        if col not in qcols:
+            db.execute(f'ALTER TABLE quiz_questions ADD COLUMN {col} {ddl}')
+            db.commit()
     if not query_one('SELECT 1 FROM users LIMIT 1'):
         seed(db)
-    if not query_one('SELECT 1 FROM quiz_questions LIMIT 1'):
-        seed_quiz(db)
+    if not query_one('SELECT 1 FROM groups LIMIT 1'):
+        seed_groups(db)
+    if not query_one('SELECT 1 FROM quiz_questions WHERE groupId IS NULL LIMIT 1'):
+        seed_quiz_public(db)
+    if not query_one("SELECT 1 FROM quiz_questions WHERE groupId = 'g1' LIMIT 1"):
+        seed_quiz_group(db)
 
 
 def json_dumps(value) -> str:

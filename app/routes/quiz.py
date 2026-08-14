@@ -4,8 +4,8 @@ import random
 from flask import Blueprint, g, jsonify, request
 
 from ..auth import require_auth
-from ..db import commit, execute, gen_id, json_loads, now_iso, query_all
-from ..errors import bad_request
+from ..db import commit, execute, gen_id, json_loads, now_iso, query_all, query_one
+from ..errors import bad_request, forbidden
 
 bp = Blueprint('quiz', __name__)
 
@@ -26,18 +26,40 @@ def best_view(rows: list) -> dict | None:
 @bp.get('/quiz/questions')
 @require_auth
 def list_questions():
-    """?count= 随机抽题数量（默认 10，上限 20）。"""
+    """?group=<id>&count= 按所选用户组的抽题机制抽取（默认 10，上限 20）。
+
+    group 省略时使用公共题库；group 必须是本人所在的组。
+    quizMode：group 只用组内；fallback 组内为空回退公共；mixed 组内与公共混合。
+    """
     try:
         count = max(1, min(int(request.args.get('count', 10)), MAX_QUESTIONS))
     except ValueError:
         count = 10
-    all_items = [question_view(r) for r in query_all('SELECT * FROM quiz_questions')]
-    total = len(all_items)
-    if total > count:
-        items = random.sample(all_items, count)
+    group_id = request.args.get('group')
+    group = None
+    if group_id:
+        group = query_one(
+            'SELECT g.id, g.name, g.quizMode FROM group_members gm JOIN groups g ON g.id = gm.groupId '
+            "WHERE gm.userId = ? AND gm.role = 'member' AND gm.groupId = ?",
+            (g.user['id'], group_id),
+        )
+        if not group:
+            raise forbidden('仅可玩自己所在组的题库')
+        pool = [question_view(r) for r in query_all('SELECT * FROM quiz_questions WHERE groupId = ?', (group_id,))]
+        if group['quizMode'] == 'mixed':
+            pool += [question_view(r) for r in query_all('SELECT * FROM quiz_questions WHERE groupId IS NULL')]
+        elif group['quizMode'] == 'fallback' and not pool:
+            pool = [question_view(r) for r in query_all('SELECT * FROM quiz_questions WHERE groupId IS NULL')]
     else:
-        items = all_items
-    return jsonify({'items': items, 'total': total})
+        pool = [question_view(r) for r in query_all('SELECT * FROM quiz_questions WHERE groupId IS NULL')]
+    total = len(pool)
+    if total > count:
+        pool = random.sample(pool, count)
+    return jsonify({
+        'items': pool,
+        'total': total,
+        'group': {'id': group['id'], 'name': group['name']} if group else None,
+    })
 
 
 @bp.post('/quiz/attempts')
