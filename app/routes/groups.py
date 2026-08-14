@@ -11,8 +11,9 @@ QUIZ_MODES = ('group', 'fallback', 'mixed')
 
 
 def require_teacher() -> None:
-    if g.user['role'] != 'teacher':
-        raise forbidden('仅教师可执行此操作')
+    """教师或管理角色（teacher/schooladmin/admin/superadmin）。"""
+    if g.user['role'] not in ('teacher', 'schooladmin', 'admin', 'superadmin'):
+        raise forbidden('仅教师或管理角色可执行此操作')
 
 
 def get_group_or_404(group_id: str) -> dict:
@@ -23,6 +24,9 @@ def get_group_or_404(group_id: str) -> dict:
 
 
 def require_manager(group_id: str) -> None:
+    """管理角色可管理任意组；教师需为该组负责老师。"""
+    if g.user['role'] in ('schooladmin', 'admin', 'superadmin'):
+        return
     if not query_one(
         "SELECT 1 FROM group_members WHERE groupId = ? AND userId = ? AND role = 'teacher'",
         (group_id, g.user['id']),
@@ -77,13 +81,16 @@ def validate_question(body: dict) -> dict:
 @bp.get('/groups')
 @require_auth
 def list_groups():
-    """教师：我负责管理的用户组（含成员数/题数/抽题机制）。"""
+    """我负责管理的用户组（管理角色返回全部组）。"""
     require_teacher()
-    rows = query_all(
-        'SELECT g.* FROM group_members gm JOIN groups g ON g.id = gm.groupId '
-        "WHERE gm.userId = ? AND gm.role = 'teacher' ORDER BY g.updatedAt DESC",
-        (g.user['id'],),
-    )
+    if g.user['role'] in ('schooladmin', 'admin', 'superadmin'):
+        rows = query_all('SELECT * FROM groups ORDER BY updatedAt DESC')
+    else:
+        rows = query_all(
+            'SELECT g.* FROM group_members gm JOIN groups g ON g.id = gm.groupId '
+            "WHERE gm.userId = ? AND gm.role = 'teacher' ORDER BY g.updatedAt DESC",
+            (g.user['id'],),
+        )
     return jsonify({'items': [group_view(r) for r in rows], 'total': len(rows)})
 
 

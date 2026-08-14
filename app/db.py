@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   password TEXT NOT NULL,
   name TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('student', 'teacher'))
+  role TEXT NOT NULL CHECK (role IN ('student', 'teacher', 'schooladmin', 'admin', 'superadmin'))
 );
 CREATE TABLE IF NOT EXISTS topics (
   id TEXT PRIMARY KEY,
@@ -269,6 +269,9 @@ _seed_users = [
     ('u3', 'student3', '123456', '王五', 'student'),
     ('u4', 'student4', '123456', '赵六', 'student'),
     ('t1', 'teacher', '123456', '王老师', 'teacher'),
+    ('sa1', 'superadmin', '123456', '系统管理员', 'superadmin'),
+    ('ad1', 'admin', '123456', '平台管理员', 'admin'),
+    ('sc1', 'schooladmin', '123456', '校管理员', 'schooladmin'),
 ]
 
 _seed_topics = [
@@ -593,6 +596,17 @@ def init_db() -> None:
     """建表（含轻量迁移）；users 为空时写入种子数据。"""
     db = get_db()
     db.executescript(SCHEMA)
+    # users 角色扩展迁移：旧库 CHECK 不含 superadmin 时重建表
+    users_ddl = query_one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")['sql']
+    if 'superadmin' not in users_ddl:
+        db.execute('ALTER TABLE users RENAME TO users_old')
+        db.executescript(SCHEMA)
+        db.execute(
+            'INSERT INTO users (id, username, password, name, role) '
+            'SELECT id, username, password, name, role FROM users_old',
+        )
+        db.execute('DROP TABLE users_old')
+        db.commit()
     cols = [r['name'] for r in db.execute('PRAGMA table_info(projects)').fetchall()]
     if 'description' not in cols:
         db.execute("ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''")

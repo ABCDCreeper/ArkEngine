@@ -153,7 +153,7 @@ def project_detail(project_id):
 def update_project(project_id):
     """更新项目名/简介；status=finished 结题（记录 finishedAt 并生成里程碑反馈）。组员与教师均可填写简介。"""
     project = get_project_or_404(project_id)
-    if g.user['role'] != 'teacher':
+    if g.user['role'] not in ('teacher', 'schooladmin', 'admin', 'superadmin'):
         member_of(project['id'], g.user)
     body = get_json_body()
     if 'name' in body:

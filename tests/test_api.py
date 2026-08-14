@@ -24,6 +24,9 @@ class ApiTestCase(unittest.TestCase):
         self.student2 = self._login('student2', '123456')
         self.student4 = self._login('student4', '123456')
         self.teacher = self._login('teacher', '123456')
+        self.superadmin = self._login('superadmin', '123456')
+        self.admin = self._login('admin', '123456')
+        self.schooladmin = self._login('schooladmin', '123456')
 
     def tearDown(self):
         os.unlink(self.db_path)
@@ -860,6 +863,122 @@ class ApiTestCase(unittest.TestCase):
         # 学生访问 -> 403
         res = self._get(self.student, '/api/teacher/projects?group=g1')
         self.assert_error(res, 403, 'FORBIDDEN')
+
+    # ------------------------------------------------------------ 用户管理（管理角色）
+
+    def test_admin_user_management_scopes(self):
+        # 非管理角色 -> 403
+        res = self._get(self.student, '/api/admin/users')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        res = self._get(self.teacher, '/api/admin/users')
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 校管理员：只能看到老师/学生
+        items = self._get(self.schooladmin, '/api/admin/users').get_json()['items']
+        roles = {u['role'] for u in items}
+        self.assertEqual(roles, {'student', 'teacher'})
+        self.assertNotIn('schooladmin', roles)
+        # 管理员：能看到校管理员及以下
+        roles = {u['role'] for u in self._get(self.admin, '/api/admin/users').get_json()['items']}
+        self.assertEqual(roles, {'student', 'teacher', 'schooladmin'})
+        # 超级管理员：能看到管理员及以下
+        roles = {u['role'] for u in self._get(self.superadmin, '/api/admin/users').get_json()['items']}
+        self.assertEqual(roles, {'student', 'teacher', 'schooladmin', 'admin'})
+        # 均不含自己
+        ids = [u['id'] for u in self._get(self.superadmin, '/api/admin/users').get_json()['items']]
+        self.assertNotIn('sa1', ids)
+
+    def test_admin_user_create_update_delete(self):
+        # 校管理员不能创建校管理员及以上
+        res = self._post(self.schooladmin, '/api/admin/users',
+                         {'username': 'sc2', 'password': '123456', 'name': '新校管', 'role': 'schooladmin'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 管理员可创建校管理员，超级管理员可创建管理员
+        res = self._post(self.admin, '/api/admin/users',
+                         {'username': 'sc2', 'password': '123456', 'name': '新校管', 'role': 'schooladmin'})
+        self.assertEqual(res.status_code, 201)
+        sc2 = res.get_json()
+        self.assertEqual(sc2['role'], 'schooladmin')
+        res = self._post(self.superadmin, '/api/admin/users',
+                         {'username': 'ad2', 'password': '123456', 'name': '新管理员', 'role': 'admin'})
+        self.assertEqual(res.status_code, 201)
+        ad2 = res.get_json()
+        # 超级管理员不能创建超级管理员
+        res = self._post(self.superadmin, '/api/admin/users',
+                         {'username': 'sa2', 'password': '123456', 'name': '新超管', 'role': 'superadmin'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 改名/重置密码/改角色
+        res = self._patch(self.superadmin, f"/api/admin/users/{ad2['id']}", {'name': '管理员二号', 'role': 'schooladmin'})
+        self.assertEqual(res.get_json()['name'], '管理员二号')
+        self.assertEqual(res.get_json()['role'], 'schooladmin')
+        # 同级管理员不可互管（ad3 由超管创建，admin 不能改）
+        res = self._post(self.superadmin, '/api/admin/users',
+                         {'username': 'ad3', 'password': '123456', 'name': '三号管理员', 'role': 'admin'})
+        ad3 = res.get_json()
+        res = self._patch(self.admin, f"/api/admin/users/{ad3['id']}", {'name': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 不能改自己
+        res = self._patch(self.superadmin, '/api/admin/users/sa1', {'name': 'x'})
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
+        # 校管理员不能调整校管理员/管理员账号
+        res = self._patch(self.schooladmin, f"/api/admin/users/{sc2['id']}", {'name': 'x'})
+        self.assert_error(res, 403, 'FORBIDDEN')
+        # 校管理员可调整老师
+        res = self._patch(self.schooladmin, '/api/admin/users/t1', {'role': 'student', 'password': 'abcdef'})
+        self.assertEqual(res.get_json()['role'], 'student')
+        # 重置后的密码可登录
+        login = self.client.post('/api/sessions', json={'username': 'teacher', 'password': 'abcdef'})
+        self.assertEqual(login.status_code, 201)
+        self.assertEqual(login.get_json()['user']['role'], 'student')
+        # 删除：管理员删除校管理员，级联生效
+        res = self._delete(self.admin, f"/api/admin/users/{sc2['id']}")
+        self.assertEqual(res.status_code, 204)
+        res = self._get(self.admin, '/api/admin/users')
+        self.assertNotIn(sc2['id'], [u['id'] for u in res.get_json()['items']])
+        # 删除更高层 -> 403
+        res = self._delete(self.admin, '/api/admin/users/sa1')
+        self.assert_error(res, 403, 'FORBIDDEN')
+
+    def test_admin_delete_cascade(self):
+        # u4 加入 g1、加入 p2、有专注记录，删除后关联数据清理
+        self._post(self.teacher, '/api/groups/g1/members', {'userId': 'u4', 'role': 'member'})
+        self._post(self.student4, '/api/focus-sessions', {'durationMin': 25, 'type': 'focus'})
+        res = self._delete(self.schooladmin, '/api/admin/users/u4')
+        self.assertEqual(res.status_code, 204)
+        res = self._get(self.schooladmin, '/api/admin/users')
+        self.assertNotIn('u4', [u['id'] for u in res.get_json()['items']])
+        # u4 的组成员关系与专注记录已级联删除
+        members = self._get(self.teacher, '/api/groups/g1/members').get_json()['items']
+        self.assertNotIn('u4', [m['userId'] for m in members])
+        items = self._get(self.schooladmin, '/api/focus-sessions').get_json()['items']
+        self.assertEqual(items, [])
+        # 项目成员同步移除
+        res = self._get(self.teacher, '/api/projects/p2')
+        self.assertNotIn('u4', [m['id'] for m in res.get_json()['members']])
+
+    def test_schooladmin_manages_any_group(self):
+        # 校管理员可管理任意组（g1）与建新组
+        gid = self._post(self.schooladmin, '/api/groups', {'name': '校管建的组'}).get_json()['id']
+        res = self._post(self.schooladmin, f'/api/groups/{gid}/members', {'userId': 'u4', 'role': 'member'})
+        self.assertEqual(res.status_code, 201)
+        res = self._post(self.schooladmin, '/api/groups/g1/members', {'userId': 'u4', 'role': 'member'})
+        self.assertEqual(res.status_code, 201)
+        res = self._post(self.schooladmin, f'/api/groups/{gid}/questions', {
+            'question': '校管出的题', 'category': '综合', 'difficulty': 1,
+            'options': ['A1', 'A2', 'A3', 'A4'], 'answer': 0, 'explanation': '校管解析',
+        })
+        self.assertEqual(res.status_code, 201)
+        # 列表返回全部组
+        groups = self._get(self.schooladmin, '/api/groups').get_json()['items']
+        self.assertEqual(len(groups), 2)
+        # 团队总览可见全部项目
+        ids = [p['id'] for p in self._get(self.schooladmin, '/api/teacher/projects').get_json()['items']]
+        self.assertEqual(ids, ['p1', 'p2'])
+
+    def test_register_role_still_limited(self):
+        res = self.client.post('/api/users', json={
+            'username': 'badadmin', 'password': '123456', 'name': '坏管理员', 'role': 'admin',
+        })
+        self.assert_error(res, 400, 'VALIDATION_ERROR')
 
     # ------------------------------------------------------------ 通用约定
 

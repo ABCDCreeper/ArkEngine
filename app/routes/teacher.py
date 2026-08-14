@@ -17,27 +17,34 @@ from ..services import (
 bp = Blueprint('teacher', __name__)
 
 
+def is_teacher_tier(user: dict) -> bool:
+    return user['role'] in ('teacher', 'schooladmin', 'admin', 'superadmin')
+
+
 @bp.get('/teacher/projects')
 @require_auth
 def teacher_projects():
-    """团队总览（仅教师）：默认我管理的组 + 公共项目；?group=<id> 只看该组（契约 3.8）。"""
-    if g.user['role'] != 'teacher':
-        raise forbidden('仅教师可访问')
+    """团队总览（仅教师/管理角色）：默认我管理的组 + 公共项目；?group=<id> 只看该组（契约 3.8）。"""
+    if not is_teacher_tier(g.user):
+        raise forbidden('仅教师或管理角色可访问')
     group_id = request.args.get('group')
     if group_id:
         if not query_one(
             "SELECT 1 FROM group_members WHERE groupId = ? AND userId = ? AND role = 'teacher'",
             (group_id, g.user['id']),
-        ):
+        ) and g.user['role'] not in ('schooladmin', 'admin', 'superadmin'):
             raise forbidden('仅可查看自己管理的组')
         rows = query_all('SELECT * FROM projects WHERE groupId = ? ORDER BY updatedAt DESC', (group_id,))
     else:
-        rows = query_all(
-            'SELECT * FROM projects WHERE groupId IS NULL OR groupId IN '
-            "(SELECT groupId FROM group_members WHERE userId = ? AND role = 'teacher') "
-            'ORDER BY updatedAt DESC',
-            (g.user['id'],),
-        )
+        if g.user['role'] in ('schooladmin', 'admin', 'superadmin'):
+            rows = query_all('SELECT * FROM projects ORDER BY updatedAt DESC')
+        else:
+            rows = query_all(
+                'SELECT * FROM projects WHERE groupId IS NULL OR groupId IN '
+                "(SELECT groupId FROM group_members WHERE userId = ? AND role = 'teacher') "
+                'ORDER BY updatedAt DESC',
+                (g.user['id'],),
+            )
     return jsonify(paged([project_view(p) for p in rows]))
 
 
@@ -54,9 +61,9 @@ def list_annotations(project_id):
 @bp.post('/projects/<project_id>/annotations')
 @require_auth
 def create_annotation(project_id):
-    """添加批注（仅教师，契约 3.8）。"""
-    if g.user['role'] != 'teacher':
-        raise forbidden('仅教师可添加批注')
+    """添加批注（仅教师/管理角色，契约 3.8）。"""
+    if not is_teacher_tier(g.user):
+        raise forbidden('仅教师或管理角色可添加批注')
     project = get_project_or_404(project_id)
     body = get_json_body()
     content = str(body.get('content') or '').strip()

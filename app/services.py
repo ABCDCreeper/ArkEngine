@@ -43,8 +43,8 @@ def member_of(project_id: str, user: dict) -> None:
 
 
 def ensure_read_access(project_id: str, user: dict) -> None:
-    """读操作：教师、项目成员、公共项目、同组成员可读（组间隔离）。"""
-    if user['role'] == 'teacher':
+    """读操作：教师/管理角色、项目成员、公共项目、同组成员可读（组间隔离）。"""
+    if user['role'] in ('teacher', 'schooladmin', 'admin', 'superadmin'):
         return
     if query_one('SELECT 1 FROM members WHERE projectId = ? AND userId = ?', (project_id, user['id'])):
         return

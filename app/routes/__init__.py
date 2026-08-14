@@ -1,11 +1,11 @@
 """蓝图注册：所有子模块挂到 /api 前缀下。"""
 from flask import Blueprint
 
-from . import activity, auth, focus, groups, kanban, projects, quiz, resources, tasks, teacher
+from . import activity, admin, auth, focus, groups, kanban, projects, quiz, resources, tasks, teacher
 
 api = Blueprint('api', __name__)
 
-for module in (auth, projects, kanban, tasks, activity, resources, focus, teacher, quiz, groups):
+for module in (auth, projects, kanban, tasks, activity, resources, focus, teacher, quiz, groups, admin):
     api.register_blueprint(module.bp)
 
 
