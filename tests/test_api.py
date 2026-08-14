@@ -730,9 +730,12 @@ class ApiTestCase(unittest.TestCase):
         # 已在组内
         res = self._post(self.student4, '/api/groups/join', {'inviteCode': 'G1-KM3X'})
         self.assert_error(res, 409, 'ALREADY_MEMBER')
-        # mine 现在包含 g1
+        # mine 现在包含 g1（含统计字段，不暴露邀请码）
         mine = self._get(self.student4, '/api/groups/mine').get_json()['items']
         self.assertIn('g1', [g['id'] for g in mine])
+        self.assertNotIn('inviteCode', mine[0])
+        self.assertIn('quizMode', mine[0])
+        self.assertIn('questionCount', mine[0])
         # 新建的组会自动生成邀请码
         gid = self._post(self.teacher, '/api/groups', {'name': '新组'}).get_json()['id']
         self.assertTrue(self._get(self.teacher, '/api/groups').get_json()['items'][0]['inviteCode'].startswith('G'))

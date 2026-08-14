@@ -90,13 +90,16 @@ def list_groups():
 @bp.get('/groups/mine')
 @require_auth
 def my_groups():
-    """学生：我所在的用户组列表（含抽题机制，多组并列）。"""
+    """学生：我所在的用户组列表（含抽题机制与统计，多组并列；不暴露邀请码）。"""
     rows = query_all(
-        'SELECT g.id, g.name, g.quizMode FROM group_members gm JOIN groups g ON g.id = gm.groupId '
+        'SELECT g.* FROM group_members gm JOIN groups g ON g.id = gm.groupId '
         "WHERE gm.userId = ? AND gm.role = 'member' ORDER BY g.name",
         (g.user['id'],),
     )
-    return jsonify({'items': rows, 'total': len(rows)})
+    items = [group_view(r) for r in rows]
+    for item in items:
+        item.pop('inviteCode', None)
+    return jsonify({'items': items, 'total': len(items)})
 
 
 @bp.post('/groups')
