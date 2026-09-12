@@ -36,10 +36,6 @@ EVAL_MIN, EVAL_MAX = 1, 5
 PEER_VERDICTS = ('acknowledge', 'question')
 
 
-def review_view(row: dict) -> dict:
-    return row
-
-
 def task_reviews(task_id: str) -> list[dict]:
     return query_all(
         'SELECT r.*, u.name AS reviewerName FROM task_reviews r '
