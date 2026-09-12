@@ -1317,37 +1317,37 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(self._post(self.student2, '/api/projects/p1/tasks', {'title': '重新加入后可建'}).status_code, 201)
 
     def test_focus_stats_respects_client_timezone(self):
-        """自然日按客户端时区划分：否则本地早上 8 点才翻页，「今日专注」与直觉不符。"""
+        """client timezone offset shifts focus session into correct calendar day"""
         from datetime import datetime, timedelta, timezone
 
-        # 用全新账号，避免种子里的历史专注记录干扰边界断言
+        # fresh user to avoid seed data interference
         created = self._post(self.schooladmin, '/api/admin/users',
-                             {'username': 'tzprobe', 'password': '123456', 'name': '时区探针', 'role': 'student'})
+                             {'username': 'tzprobe', 'password': '123456', 'name': 'tz probe', 'role': 'student'})
         self.assertEqual(created.status_code, 201, created.get_json())
         probe = self._login('tzprobe', '123456')
-        # 一条记录：UTC 昨天中午，在 UTC 和 UTC+8 都落在昨天
+        # session at UTC yesterday 23:00 = UTC+8 today 07:00
         boundary = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
-            hour=12, minute=0, second=0, microsecond=0)
+            hour=23, minute=0, second=0, microsecond=0)
         with self.app.app_context():
             execute('INSERT INTO focus_sessions (id, userId, durationMin, type, createdAt) VALUES (?, ?, ?, ?, ?)',
                     ('fs_boundary', probe['user']['id'], 30, 'focus', iso(boundary)))
             commit()
 
         utc8_tz = timezone(timedelta(minutes=480))
-        # 用 week 数组验证：记录在 UTC 和 UTC+8 下出现在各自的日期槽位
+        # UTC view: session appears in yesterday's slot
         utc = self._get(probe, '/api/focus/stats?days=3&tzOffset=0').get_json()
         boundary_utc = boundary.date().isoformat()
         utc_entry = next(e for e in utc['week'] if e['date'] == boundary_utc)
         self.assertEqual(utc_entry['minutes'], 30)
 
+        # UTC+8 view: same session appears in today's slot with a different date
         local = self._get(probe, '/api/focus/stats?days=3&tzOffset=480').get_json()
         boundary_local = boundary.astimezone(utc8_tz).date().isoformat()
         local_entry = next(e for e in local['week'] if e['date'] == boundary_local)
         self.assertEqual(local_entry['minutes'], 30)
-        # UTC 和 UTC+8 下的日期不同，证明时区偏移生效
         self.assertNotEqual(utc_entry['date'], local_entry['date'])
 
-        # 越界或非法偏移量必须被夹紧而不是报错
+        # out-of-range and invalid offsets are clamped, not rejected
         self.assertEqual(self._get(probe, '/api/focus/stats?tzOffset=abc').status_code, 200)
         capped = self._get(probe, '/api/focus/stats?days=3&tzOffset=840').get_json()
         self.assertEqual(self._get(probe, '/api/focus/stats?days=3&tzOffset=99999').get_json(), capped)
