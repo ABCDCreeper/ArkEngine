@@ -1,0 +1,102 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 端到端需要前端仓库：后端在构建产物存在时会一并提供页面，因此一个进程即可跑完整流程。
+      # ref 显式指定：默认 main，可用仓库变量 FRONTEND_REF 固定到某个分支或标签，
+      # 避免"后端已推送、前端还没推送"时把新后端和旧前端配在一起。
+      - name: Checkout frontend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.FRONTEND_REPO || 'Simoncxm2010/InnoArk' }}
+          ref: ${{ vars.FRONTEND_REF || 'main' }}
+          path: InnoArk-main
+
+      - name: Report frontend revision
+        working-directory: InnoArk-main
+        run: |
+          echo "frontend commit: $(git rev-parse HEAD)"
+          echo "frontend commit time: $(git log -1 --format=%ci)"
+          echo "triggering backend commit: $GITHUB_SHA"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build frontend
+        working-directory: InnoArk-main
+        run: |
+          corepack enable
+          yarn install --frozen-lockfile
+          yarn build
+
+      # 构建产物必须与后端契约匹配：两个仓库分开发布，先推送后端再推送前端时，
+      # 这里检出的前端可能还是旧的——与其让端到端在第一个断言处给出费解的失败，
+      # 不如在这里直接说明原因。
+      - name: Check frontend matches backend contract
+        working-directory: InnoArk-main
+        run: |
+          missing=0
+          for marker in "项标准" "同伴互评" "教师评分" "教学总览" "待同步"; do
+            if grep -rq -- "$marker" dist/assets; then
+              echo "ok: $marker"
+            else
+              echo "::error::前端构建产物缺少「$marker」，与后端契约不匹配：请先把前端仓库推送到 main（或设置 FRONTEND_REF），再重新运行本工作流。"
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Install Playwright
+        run: |
+          npm install --no-save --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+
+      - name: Start server
+        env:
+          ARK_DATABASE: ${{ github.workspace }}/e2e.db
+          ARK_FRONTEND_DIST: ${{ github.workspace }}/InnoArk-main/dist
+          PORT: '5000'
+          HOST: '127.0.0.1'
+          FLASK_DEBUG: '0'
+        run: |
+          python -u run.py > server.log 2>&1 &
+          for attempt in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5000/ >/dev/null; then
+              echo "server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not start"; cat server.log; exit 1
+
+      - name: Run end-to-end suite
+        env:
+          INNOARK_URL: http://127.0.0.1:5000
+          CI: 'true'
+        run: node e2e/flows.cjs
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure
+          path: |
+            server.log
+            e2e-failure.png
+          if-no-files-found: ignore
